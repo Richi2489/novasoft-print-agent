@@ -13,6 +13,7 @@ package printer
 import (
 	"bytes"
 	"fmt"
+	"log"
 	"strings"
 
 	"github.com/Richi2489/novasoft-print-agent/pkg/escpos"
@@ -63,9 +64,20 @@ type Section struct {
 // para enviar a la impresora. Falla si encuentra un tipo de sección
 // desconocido — mejor fallar ruidoso que imprimir un ticket incompleto
 // sin que nadie se entere.
+//
+// Secuencia inicial:
+//  1. ESC @ (INIT) — reset completo.
+//  2. ESC t 2 (SELECT_CP850) — indica a la impresora que interprete los
+//     bytes de texto como Code Page 850. Sin esto, los acentos UTF-8
+//     salen rotos (ó → Ã³, ¡ → Ai, etc). Ver pkg/escpos/encoding.go.
+//
+// Todo el texto user-facing pasa por escpos.EncodeCP850 antes de ser
+// escrito al buffer. Runes no representables caen a '?' antes que
+// romper el ticket.
 func Convert(p Payload) ([]byte, error) {
 	var buf bytes.Buffer
 	buf.Write(escpos.INIT)
+	buf.Write(escpos.SELECT_CP850)
 
 	for i := range p.Sections {
 		if err := writeSection(&buf, &p.Sections[i]); err != nil {
@@ -91,10 +103,25 @@ func writeSection(buf *bytes.Buffer, s *Section) error {
 	case "cut":
 		writeCut(buf)
 	case "image":
-		// Fase 1a: placeholder. Fase 2+ descargará y convertirá a raster
-		// ESC/POS (GS v 0).
-		buf.WriteString("[LOGO]")
-		buf.Write(escpos.LINE_FEED)
+		// Download + convert a raster ESC/POS (GS v 0). Si falla, log
+		// warning y sigue — mejor un ticket sin logo que un ticket que
+		// no sale.
+		if s.URL == "" {
+			break
+		}
+		maxW := s.MaxWidthMM
+		if maxW == 0 {
+			maxW = 40
+		}
+		applyAlign(buf, "center")
+		logoBytes, err := LoadLogoESCPOS(s.URL, maxW)
+		if err != nil {
+			log.Printf("⚠️  logo no se pudo cargar (%v); imprimo sin logo", err)
+		} else {
+			buf.Write(logoBytes)
+			buf.Write(escpos.LINE_FEED)
+		}
+		applyAlign(buf, "left")
 	default:
 		return fmt.Errorf("tipo desconocido %q", s.Type)
 	}
@@ -112,14 +139,16 @@ func writeText(buf *bytes.Buffer, s *Section) {
 	}
 
 	if s.Border {
+		// Separadores de "=" son ASCII — no necesitan encoding, pero por
+		// consistencia usamos la misma ruta.
 		buf.WriteString(strings.Repeat("=", LineWidth))
 		buf.Write(escpos.LINE_FEED)
-		buf.WriteString(s.Content)
+		buf.Write(escpos.EncodeCP850(s.Content))
 		buf.Write(escpos.LINE_FEED)
 		buf.WriteString(strings.Repeat("=", LineWidth))
 		buf.Write(escpos.LINE_FEED)
 	} else {
-		buf.WriteString(s.Content)
+		buf.Write(escpos.EncodeCP850(s.Content))
 		buf.Write(escpos.LINE_FEED)
 	}
 
@@ -140,28 +169,30 @@ func writeKV(buf *bytes.Buffer, s *Section) {
 	label := s.Label
 	value := s.Value
 
-	// Nota sobre ancho con chars multibyte: utf8.RuneCountInString contaría
-	// runes correctamente, pero ESC/POS usa codepage fija (CP437 o similar)
-	// donde acentos ocupan 1 byte tras translación del driver. En la
-	// práctica con textos en español de ticket normal (nombres de producto,
-	// labels), len(string) bytes ≈ chars visibles. Trade-off aceptado —
-	// simplifica la lógica y el drift es mínimo en tickets reales.
-	padding := LineWidth - len(label) - len(value)
+	// Encoding CP850 antes de medir padding: en UTF-8 cada acento son 2
+	// bytes mientras que en CP850 es 1 byte (que coincide con el dot de
+	// impresión). Si midiéramos con len(label) sobre UTF-8, una label
+	// "Atendió" (8 bytes UTF-8 pero 7 chars visibles) calcularía padding
+	// demasiado corto y el value se desalinearía a la derecha.
+	labelEnc := escpos.EncodeCP850(label)
+	valueEnc := escpos.EncodeCP850(value)
+
+	padding := LineWidth - len(labelEnc) - len(valueEnc)
 	if padding >= 1 {
-		buf.WriteString(label)
+		buf.Write(labelEnc)
 		buf.WriteString(strings.Repeat(" ", padding))
-		buf.WriteString(value)
+		buf.Write(valueEnc)
 	} else {
 		// No cabe en una línea — label arriba, value alineado a la
 		// derecha abajo.
-		buf.WriteString(label)
+		buf.Write(labelEnc)
 		buf.Write(escpos.LINE_FEED)
-		rightPad := LineWidth - len(value)
+		rightPad := LineWidth - len(valueEnc)
 		if rightPad < 0 {
 			rightPad = 0
 		}
 		buf.WriteString(strings.Repeat(" ", rightPad))
-		buf.WriteString(value)
+		buf.Write(valueEnc)
 	}
 	buf.Write(escpos.LINE_FEED)
 
