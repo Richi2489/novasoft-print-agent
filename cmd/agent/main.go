@@ -2,7 +2,7 @@
 //
 // Subcomandos:
 //   pair     Empareja con un restaurante usando un código del wizard.
-//   run      Abre WebSocket con el backend y procesa jobs.
+//   run      Abre SSE con el backend y procesa jobs.
 //   status   Muestra la config actual y las impresoras detectadas.
 //   unpair   Borra la config local.
 //   version  Imprime la versión.
@@ -10,6 +10,12 @@
 // Uso típico:
 //   novasoft-agent.exe pair        # primera vez
 //   novasoft-agent.exe run         # deja corriendo
+//
+// Transporte: desde v0.2.0 el agent usa SSE (HTTP/1.1 streaming) en
+// lugar de WebSocket. Motivo: Railway+Fastly strippean el header
+// Upgrade: websocket antes de llegar al origin, así que la conexión WS
+// nunca completaba. SSE funciona sin config especial por ser HTTP puro.
+// Ver ADR-015 del backend para detalles.
 package main
 
 import (
@@ -20,7 +26,6 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -29,7 +34,7 @@ import (
 	"github.com/Richi2489/novasoft-print-agent/internal/config"
 	"github.com/Richi2489/novasoft-print-agent/internal/pairing"
 	"github.com/Richi2489/novasoft-print-agent/internal/printer"
-	"github.com/Richi2489/novasoft-print-agent/internal/websocket"
+	"github.com/Richi2489/novasoft-print-agent/internal/sse"
 )
 
 // Version se inyecta en build vía -ldflags "-X main.Version=vX.Y.Z".
@@ -146,7 +151,7 @@ func cmdPair(backendURL string) error {
 	return nil
 }
 
-// cmdRun carga config, detecta impresora, abre WS, procesa jobs.
+// cmdRun carga config, detecta impresora, abre SSE, procesa jobs.
 func cmdRun() error {
 	cfg, err := config.Load()
 	if err != nil {
@@ -177,23 +182,25 @@ func cmdRun() error {
 	fmt.Printf("→ Usando: %s\n", selected.Name)
 	fmt.Println()
 
-	// 2. Resolver URL del WebSocket.
-	// Preferimos la URL del pair response; si el host no coincide con el
-	// BackendURL, derivamos desde BackendURL (más robusto para deploys
-	// donde el backend reporta un dominio que no resuelve desde el cliente
-	// — p. ej. api.novasoft.mx que aún no CNAMEa a Railway).
-	wsURL := resolveWSURL(cfg.WebsocketURL, cfg.BackendURL)
-	fmt.Printf("→ Conectando a %s\n", wsURL)
+	// 2. El endpoint SSE se deriva del BackendURL del config (que el
+	// agent guardó al emparejarse). Ignoramos cfg.WebsocketURL — ese
+	// campo se preserva para back-compat pero en el pivot SSE no lo
+	// usamos; el backend del pair response devuelve un URL informativo
+	// que puede apuntar a un dominio distinto del Railway URL efectivo
+	// (p. ej. api.novasoft.mx sin CNAME).
+	backend := strings.TrimRight(cfg.BackendURL, "/")
+	fmt.Printf("→ Conectando a %s/printing/agents/stream\n", backend)
 
-	// 3. Cliente WebSocket con callback de impresión.
-	client := websocket.New(wsURL, cfg.AgentToken)
-	client.OnPrintJob = func(job *websocket.PrintJob) {
-		handleJob(client, selected, job)
-	}
-
-	// 4. Context cancelable por signal.
+	// 3. Cliente SSE con callback de impresión.
+	client := sse.New(backend, cfg.AgentToken)
+	// Context cancelable por signal — lo creamos antes del callback para
+	// que handleJob pueda usarlo como parent del POST de reporte.
 	ctx, cancel := signalContext()
 	defer cancel()
+
+	client.OnPrintJob = func(job *sse.PrintJob) {
+		handleJob(ctx, client, selected, job)
+	}
 
 	client.RunWithReconnect(ctx)
 
@@ -205,34 +212,34 @@ func cmdRun() error {
 // handleJob convierte el payload del job a ESC/POS y lo imprime.
 // Reporta resultado al backend sin fallar el agent — si la impresora
 // está offline, el agent sigue escuchando por si llega el siguiente.
-func handleJob(client *websocket.Client, p *printer.Printer, job *websocket.PrintJob) {
+func handleJob(ctx context.Context, client *sse.Client, p *printer.Printer, job *sse.PrintJob) {
 	log.Printf("📄 Job recibido: %s (%s)", job.ID, job.JobType)
 
 	var payload printer.Payload
 	if err := json.Unmarshal(job.Payload, &payload); err != nil {
 		msg := fmt.Sprintf("payload inválido: %v", err)
 		log.Printf("✗ %s", msg)
-		_ = client.ReportJobResult(job.ID, "failed", msg)
+		_ = client.ReportJobResult(ctx, job.ID, "failed", msg)
 		return
 	}
 
-	bytes, err := printer.Convert(payload)
+	escposBytes, err := printer.Convert(payload)
 	if err != nil {
 		msg := fmt.Sprintf("conversión ESC/POS: %v", err)
 		log.Printf("✗ %s", msg)
-		_ = client.ReportJobResult(job.ID, "failed", msg)
+		_ = client.ReportJobResult(ctx, job.ID, "failed", msg)
 		return
 	}
 
-	if err := printer.SendRaw(p, bytes); err != nil {
+	if err := printer.SendRaw(p, escposBytes); err != nil {
 		msg := fmt.Sprintf("impresión: %v", err)
 		log.Printf("✗ %s", msg)
-		_ = client.ReportJobResult(job.ID, "failed", msg)
+		_ = client.ReportJobResult(ctx, job.ID, "failed", msg)
 		return
 	}
 
 	log.Printf("✓ Impreso: %s", job.ID)
-	_ = client.ReportJobResult(job.ID, "printed", "")
+	_ = client.ReportJobResult(ctx, job.ID, "printed", "")
 }
 
 // cmdStatus imprime info diagnóstica para troubleshoot.
@@ -253,7 +260,8 @@ func cmdStatus() error {
 	} else {
 		fmt.Printf("Agent ID:      %s\n", cfg.AgentID)
 		fmt.Printf("Backend URL:   %s\n", cfg.BackendURL)
-		fmt.Printf("WebSocket URL: %s\n", resolveWSURL(cfg.WebsocketURL, cfg.BackendURL))
+		fmt.Printf("Stream URL:    %s/printing/agents/stream\n",
+			strings.TrimRight(cfg.BackendURL, "/"))
 		if cfg.PrinterName != "" {
 			fmt.Printf("Printer:       %s (fijada en config)\n", cfg.PrinterName)
 		}
@@ -289,60 +297,6 @@ func cmdUnpair() error {
 	}
 	fmt.Println("✓ Config borrada.")
 	return nil
-}
-
-// resolveWSURL decide qué URL de WebSocket usar.
-// Si wsFromResponse y backendURL tienen el mismo host, usa wsFromResponse
-// directo (confiamos en el backend). Si los hosts difieren — el backend
-// reporta p.ej. "api.novasoft.mx" pero el cliente está hablando con
-// "xxx.up.railway.app" — derivamos la WS URL desde el backendURL
-// cambiando https→wss y agregando el path /ws/printing. Esto hace al
-// agent robusto ante configuraciones donde el dominio de marca aún no
-// apunta al deploy.
-func resolveWSURL(wsFromResponse, backendURL string) string {
-	if wsFromResponse == "" {
-		return deriveWSFromBackend(backendURL)
-	}
-	if backendURL == "" {
-		return wsFromResponse
-	}
-
-	ws, err1 := url.Parse(wsFromResponse)
-	be, err2 := url.Parse(backendURL)
-	if err1 != nil || err2 != nil {
-		return wsFromResponse
-	}
-	if ws.Host == be.Host {
-		return wsFromResponse
-	}
-	// Hosts distintos → derivamos. Log el fallback para visibilidad.
-	derived := deriveWSFromBackend(backendURL)
-	log.Printf("ℹ️  WS URL del servidor (%s) difiere del backend (%s); uso %s",
-		ws.Host, be.Host, derived)
-	return derived
-}
-
-// deriveWSFromBackend convierte https://X → wss://X/ws/printing (y
-// http://X → ws://X/ws/printing). Mantiene host, port y quita cualquier
-// path existente.
-func deriveWSFromBackend(backendURL string) string {
-	u, err := url.Parse(backendURL)
-	if err != nil {
-		// Fallback dumb string replace — mejor algo que nada.
-		s := strings.Replace(backendURL, "https://", "wss://", 1)
-		s = strings.Replace(s, "http://", "ws://", 1)
-		return strings.TrimRight(s, "/") + "/ws/printing"
-	}
-	switch u.Scheme {
-	case "https":
-		u.Scheme = "wss"
-	case "http":
-		u.Scheme = "ws"
-	}
-	u.Path = "/ws/printing"
-	u.RawQuery = ""
-	u.Fragment = ""
-	return u.String()
 }
 
 // signalContext construye un context que se cancela al recibir

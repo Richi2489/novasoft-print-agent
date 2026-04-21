@@ -4,7 +4,13 @@ Agent de impresión térmica ESC/POS para **NovaSoft POS**.
 
 Binary Windows que empareja la caja del restaurante con el backend
 cloud de NovaSoft y convierte los jobs de impresión declarativos que
-recibe por WebSocket en bytes ESC/POS para tu impresora térmica 80 mm.
+recibe por Server-Sent Events en bytes ESC/POS para tu impresora
+térmica 80 mm.
+
+> **v0.2.0** (2026-04-21) pivoteó de WebSocket a SSE porque Railway +
+> Fastly strippean el header `Upgrade: websocket` antes de llegar al
+> origin. SSE es HTTP/1.1 chunked puro y pasa por cualquier CDN sin
+> config especial. Ver `ADR-015` del backend.
 
 ## ¿Qué es NovaSoft?
 
@@ -19,10 +25,11 @@ NovaSoft POS (Next.js)
       ▼
 NovaSoft backend (FastAPI, Railway)
       │ 2. POST /printing/jobs
-      │ 3. publica vía WebSocket
+      │ 3. publica vía SSE (text/event-stream)
       ▼
 novasoft-agent.exe (esta repo)
       │ 4. convierte payload → ESC/POS
+      │ 5. POST /printing/agents/jobs/{id}/result
       ▼
 Impresora térmica 80 mm
       │ 5. papel sale con la cuenta
@@ -57,7 +64,7 @@ novasoft-print-agent/
 ├── internal/
 │   ├── config/             # persistencia JSON (APPDATA / XDG)
 │   ├── pairing/            # handshake HTTP para obtener token
-│   ├── websocket/          # client gorilla con reconexión backoff
+│   ├── sse/                # cliente SSE (net/http stdlib) + POST result
 │   └── printer/            # discovery + send raw + ESC/POS converter
 │                           # (discover/print *_windows.go con build tag)
 ├── pkg/escpos/             # constantes ESC/POS (reutilizable)
@@ -69,9 +76,11 @@ novasoft-print-agent/
 
 | Package | Propósito |
 |---|---|
-| `github.com/gorilla/websocket` | WebSocket client |
 | `github.com/cenkalti/backoff/v4` | Backoff exponencial para reconexión |
 | `github.com/alexbrainman/printer` | winspool wrapper (puro syscall, sin CGO) |
+
+Desde v0.2.0: ya NO usamos `github.com/gorilla/websocket` — SSE vive
+en `net/http` del stdlib.
 
 Todas con `CGO_ENABLED=0` — el binary resulta portable single-file sin
 dependencias runtime en la máquina del cliente.
