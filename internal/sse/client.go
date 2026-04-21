@@ -59,11 +59,36 @@ type Client struct {
 
 // New construye un Client. BackendURL puede tener trailing slash o no;
 // lo normalizamos internamente.
+//
+// Importante sobre timeouts:
+//   - http.Client.Timeout = 0 (sin timeout global). Ese timeout aplica a
+//     TODO el request incluyendo body read — para un stream long-lived
+//     SSE eso cortaría el read al cumplirse y veríamos
+//     "context canceled" a cada rato.
+//   - ResponseHeaderTimeout en el Transport sí limita solo los headers
+//     (hasta que servidor responda con status + headers). Después de
+//     eso, el body lee indefinidamente hasta que el caller cierre
+//     o el context parent se cancele.
+//   - NO usamos context.WithTimeout atado al request para la apertura:
+//     ese patrón ataba el openCtx al body del response, y el cancel()
+//     posterior mataba el read con context canceled. Bug de v0.2.0.
 func New(backendURL, token string) *Client {
+	transport := &http.Transport{
+		// Timeout solo para recibir los headers iniciales. Si el
+		// servidor tarda más, fallamos el handshake y backoff reintenta.
+		// El body que sigue no tiene deadline — es un stream long-lived.
+		ResponseHeaderTimeout: handshakeTimeout,
+		// ForceAttemptHTTP2 default = true; SSE funciona tanto con
+		// HTTP/1.1 chunked como con HTTP/2 streaming. Dejamos que
+		// negocie.
+	}
 	return &Client{
 		BackendURL: strings.TrimRight(backendURL, "/"),
 		Token:      token,
-		http:       &http.Client{Timeout: 0}, // sin timeout global — los stream son long-lived
+		http: &http.Client{
+			Timeout:   0, // EXPLÍCITO — los stream son long-lived.
+			Transport: transport,
+		},
 	}
 }
 
@@ -105,10 +130,16 @@ func (c *Client) RunWithReconnect(ctx context.Context) {
 }
 
 // connectAndServe abre el stream GET, parsea eventos hasta EOF/error.
+//
+// El request se construye con el `ctx` del caller (RunWithReconnect) —
+// mismo ctx durante TODO el ciclo de vida de la conexión. El handshake
+// timeout NO se impone acá con context.WithTimeout (ese patrón, usado
+// en v0.2.0, cancelaba el ctx tras el handshake y mataba el body read
+// con "context canceled"); en su lugar el Transport.ResponseHeaderTimeout
+// configurado en New() limita solo la fase de headers.
 func (c *Client) connectAndServe(ctx context.Context) error {
 	url := c.BackendURL + "/printing/agents/stream"
 
-	// Request con contexto para poder cancelar en shutdown.
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return fmt.Errorf("build request: %w", err)
@@ -118,13 +149,11 @@ func (c *Client) connectAndServe(ctx context.Context) error {
 	req.Header.Set("Cache-Control", "no-cache")
 	req.Header.Set("User-Agent", "novasoft-print-agent")
 
-	// Handshake timeout — solo aplica al primer response. Después es
-	// long-lived. Usamos un contexto con deadline solo para la apertura.
-	openCtx, cancel := context.WithTimeout(ctx, handshakeTimeout)
-	req = req.WithContext(openCtx)
 	resp, err := c.http.Do(req)
-	cancel()
 	if err != nil {
+		// ResponseHeaderTimeout se manifiesta como net.Error con
+		// Timeout()=true. Lo devolvemos tal cual — el caller aplica
+		// backoff y reintenta.
 		return fmt.Errorf("dial SSE: %w", err)
 	}
 	defer resp.Body.Close()
@@ -139,13 +168,6 @@ func (c *Client) connectAndServe(ctx context.Context) error {
 	}
 
 	log.Println("✓ Conectado al servidor NovaSoft")
-
-	// Re-request con el parent ctx (sin el openCtx del handshake) —
-	// ya no queremos timeout en la lectura.
-	// Nota: el resp actual ya está tied al openCtx que ya canceló pero
-	// el body sigue leyéndose mientras la connection TCP esté viva.
-	// Cambiar el ctx de la request ya servida no es posible; el
-	// openCtx cancelado solo afecta nuevos sends, no el read loop.
 
 	return c.readLoop(ctx, resp.Body)
 }
