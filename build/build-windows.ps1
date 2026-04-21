@@ -8,7 +8,7 @@
 #   dist\windows\novasoft-agent.exe
 
 param(
-    [string]$Version = "0.1.0"
+    [string]$Version = "0.2.1"
 )
 
 $ErrorActionPreference = "Stop"
