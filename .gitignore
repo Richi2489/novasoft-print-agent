@@ -1,0 +1,23 @@
+# Build outputs
+dist/
+*.exe
+*.exe~
+
+# Go
+vendor/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Config local (NUNCA commitear — contiene agent_token)
+config.json
+*.local.json
+
+# Logs
+*.log
