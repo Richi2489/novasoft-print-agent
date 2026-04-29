@@ -1,0 +1,180 @@
+# Release pipeline para novasoft-print-agent.
+#
+# Trigger: push de tag `v*.*.*` (ej. `v0.3.0`, `v0.3.1-rc1`).
+#
+# Pasos:
+#   1. Resolver version desde el tag (strip "v" prefix).
+#   2. Setup Go 1.25.
+#   3. Buildear novasoft-agent.exe + novasoft-tray.exe via PS1 script.
+#   4. Instalar Inno Setup en el runner Windows (chocolatey).
+#   5. Compilar NovaSoftAgentSetup-{version}.exe.
+#   6. Generar SHA256SUMS.txt para los 3 binarios.
+#   7. Crear GitHub Release publico con los 4 assets.
+#
+# Requisitos:
+#   - Repo publico (verificado en sesion previa).
+#   - Permission `contents: write` para crear releases (ver permissions abajo).
+#   - GITHUB_TOKEN se inyecta automaticamente.
+#
+# Tags con sufijo (`-rc1`, `-beta`, `-pre`) se publican como prerelease
+# en GitHub. Tags limpias (`v0.3.0`) van como release estable.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write  # Requerido por softprops/action-gh-release@v2 para crear release.
+
+jobs:
+  build-and-release:
+    name: Build + release Windows
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          # fetch-depth: 0 para que generate_release_notes pueda ver
+          # tags previos y construir la lista de cambios desde el ultimo
+          # release.
+          fetch-depth: 0
+
+      - name: Resolve version from tag
+        id: version
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $version = $tag -replace '^v', ''
+          if (-not $version) {
+            Write-Error "No pude extraer version del tag '$tag'"
+            exit 1
+          }
+          "VERSION=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "TAG=v$version"    | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Building version: $version (tag: v$version)"
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Build agent + tray binaries
+        shell: pwsh
+        run: |
+          .\build\build-windows.ps1 -Version "${{ steps.version.outputs.VERSION }}"
+          if (-not (Test-Path "dist\windows\novasoft-agent.exe")) {
+            Write-Error "novasoft-agent.exe no se genero"
+            exit 1
+          }
+          if (-not (Test-Path "dist\windows\novasoft-tray.exe")) {
+            Write-Error "novasoft-tray.exe no se genero"
+            exit 1
+          }
+
+      - name: Install Inno Setup 6
+        run: choco install innosetup -y --no-progress
+
+      - name: Compile installer
+        shell: pwsh
+        run: |
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\iscc.exe"
+          if (-not (Test-Path $iscc)) {
+            Write-Error "iscc.exe no encontrado en $iscc — chocolatey install fallo?"
+            exit 1
+          }
+          & $iscc "/DMyAppVersion=${{ steps.version.outputs.VERSION }}" `
+                  ".\build\installer\novasoft-agent-setup.iss"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "iscc fallo con exit code $LASTEXITCODE"
+            exit $LASTEXITCODE
+          }
+          $setupExe = "dist\installer\NovaSoftAgentSetup-${{ steps.version.outputs.VERSION }}.exe"
+          if (-not (Test-Path $setupExe)) {
+            Write-Error "Setup exe no se genero en $setupExe"
+            exit 1
+          }
+          Write-Host "Installer compilado: $setupExe"
+
+      - name: Generate SHA256SUMS
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.VERSION }}"
+          $files = @(
+            "dist\windows\novasoft-agent.exe",
+            "dist\windows\novasoft-tray.exe",
+            "dist\installer\NovaSoftAgentSetup-$version.exe"
+          )
+          $sums = foreach ($f in $files) {
+            $hash = (Get-FileHash -Algorithm SHA256 $f).Hash.ToLower()
+            $name = Split-Path -Leaf $f
+            "$hash  $name"
+          }
+          # ASCII encoding sin BOM — compatible con `sha256sum -c` de Linux.
+          [System.IO.File]::WriteAllText(
+            "$PWD\dist\SHA256SUMS.txt",
+            ($sums -join "`n") + "`n",
+            [System.Text.UTF8Encoding]::new($false)
+          )
+          Get-Content "dist\SHA256SUMS.txt"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: NovaSoft Print Agent v${{ steps.version.outputs.VERSION }}
+          tag_name: ${{ steps.version.outputs.TAG }}
+          body: |
+            ## NovaSoft Print Agent v${{ steps.version.outputs.VERSION }}
+
+            Agent Windows que conecta una impresora termica ESC/POS del
+            restaurante con el backend NovaSoft via Server-Sent Events.
+            Esta release incluye instalador enterprise — el cliente final
+            instala todo con doble click, sin terminal ni PowerShell.
+
+            ### Descarga recomendada
+
+            **`NovaSoftAgentSetup-${{ steps.version.outputs.VERSION }}.exe`** — instalador
+            con wizard que configura el servicio Windows + tray icon en
+            un solo paso.
+
+            Tambien disponibles para escenarios avanzados:
+
+            - `novasoft-agent.exe` — solo el servicio core (subcomandos
+              `pair`, `run`, `install`, `start`, `stop`, etc.).
+            - `novasoft-tray.exe` — solo el tray icon (corre en sesion
+              usuario, requiere el servicio ya instalado).
+
+            ### Verificacion de integridad
+
+            ```powershell
+            Get-FileHash -Algorithm SHA256 NovaSoftAgentSetup-${{ steps.version.outputs.VERSION }}.exe
+            ```
+
+            Compara contra `SHA256SUMS.txt` adjunto a este release.
+
+            ### Requisitos del cliente
+
+            - Windows 10 o 11, 64-bit.
+            - Driver de impresora termica 80mm ya instalado.
+            - Privilegios de administrador (para registrar el servicio).
+
+            Ver [docs/SETUP.md](https://github.com/Richi2489/novasoft-print-agent/blob/main/docs/SETUP.md)
+            para instrucciones detalladas y troubleshooting.
+          files: |
+            dist/windows/novasoft-agent.exe
+            dist/windows/novasoft-tray.exe
+            dist/installer/NovaSoftAgentSetup-${{ steps.version.outputs.VERSION }}.exe
+            dist/SHA256SUMS.txt
+          fail_on_unmatched_files: true
+          # generate_release_notes agrega "What's Changed" + "New Contributors"
+          # automaticamente entre el tag actual y el ultimo release.
+          generate_release_notes: true
+          draft: false
+          # Tags como v0.3.0-rc1 o v0.3.0-pre se publican como prerelease.
+          # Solo v0.X.Y limpio se promueve a "Latest release".
+          prerelease: ${{ contains(steps.version.outputs.VERSION, '-') }}
