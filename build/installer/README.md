@@ -20,7 +20,10 @@ License → Install Location → Tasks → Install → Finish.
     .\build\installer\novasoft-agent-setup.iss
 ```
 
-Output: `dist\installer\NovaSoftAgentSetup-0.3.0-pre.exe`.
+Output: `dist\installer\NovaSoftAgentSetup.exe` (filename sin sufijo de
+versión — la versión vive en `AppVersion` y en el nombre del GitHub
+Release, así la URL `releases/latest/download/NovaSoftAgentSetup.exe`
+del wizard es estable entre versiones).
 
 ## Lo que hace el installer
 

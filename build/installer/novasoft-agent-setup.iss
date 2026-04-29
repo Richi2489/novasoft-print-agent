@@ -68,7 +68,11 @@ DisableFinishedPage=no
 LicenseFile=..\..\LICENSE.txt
 
 OutputDir=..\..\dist\installer
-OutputBaseFilename=NovaSoftAgentSetup-{#MyAppVersion}
+; OutputBaseFilename SIN sufijo de version para que la URL del wizard
+; (releases/latest/download/NovaSoftAgentSetup.exe) sea estable entre
+; versiones. La version del binario vive en AppVersion + en el nombre
+; del GitHub Release, no en el filename.
+OutputBaseFilename=NovaSoftAgentSetup
 
 Compression=lzma2/ultra
 SolidCompression=yes

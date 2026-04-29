@@ -42,6 +42,7 @@ const PipeSDDL = "D:P(A;;GA;;;SY)(A;;GRGW;;;AU)"
 type Handlers struct {
 	GetStatus func() StatusResponse
 	Restart   func() error
+	Pair      func(code, backendURL string) (agentID string, err error)
 }
 
 // Server abre el named pipe y procesa requests hasta que ctx se cancela.
@@ -144,6 +145,27 @@ func dispatch(req Request, h Handlers) Response {
 			return Response{OK: false, Error: err.Error()}
 		}
 		return Response{OK: true}
+
+	case CmdPair:
+		if h.Pair == nil {
+			return Response{OK: false, Error: "Pair handler no configurado"}
+		}
+		var pr PairRequest
+		if err := json.Unmarshal(req.Payload, &pr); err != nil {
+			return Response{OK: false, Error: "payload pair inválido: " + err.Error()}
+		}
+		if pr.Code == "" {
+			return Response{OK: false, Error: "código vacío"}
+		}
+		agentID, err := h.Pair(pr.Code, pr.BackendURL)
+		if err != nil {
+			return Response{OK: false, Error: err.Error()}
+		}
+		data, err := json.Marshal(PairResponseData{AgentID: agentID})
+		if err != nil {
+			return Response{OK: false, Error: "serialize pair response: " + err.Error()}
+		}
+		return Response{OK: true, Data: data}
 
 	default:
 		return Response{OK: false, Error: "comando desconocido: " + req.Command}

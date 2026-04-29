@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"time"
 
 	"github.com/Richi2489/novasoft-print-agent/internal/config"
 	"github.com/Richi2489/novasoft-print-agent/internal/ipc"
@@ -28,31 +29,105 @@ import (
 // inyecta con -ldflags).
 var AgentVersion = "0.3.0-dev"
 
-// Run carga config, detecta impresora, abre SSE, expone IPC, y procesa
-// jobs hasta que ctx se cancela. Errores pre-loop (no hay config, no
-// hay impresora) se devuelven inmediatamente; errores post-conexión se
-// loggean y el SSE reintenta con backoff exponencial.
+// Run es el loop principal del agent. Vive durante todo el lifetime
+// del servicio (o del CLI `run`) y soporta:
+//
+//   - Arranque sin config — se queda esperando que alguien ejecute pair
+//     (vía CLI o vía tray > Emparejar). Usaba retornar error en v0.2.x;
+//     desde v0.3.0 esperamos para que el flujo Camino C funcione: el
+//     servicio se instala antes del primer pair sin morir.
+//   - Re-pair en caliente — cuando el IPC PAIR succeeds, NotifyConfigChanged
+//     señala el inner loop para cerrar el SSE viejo y reabrir con el
+//     token nuevo. Sin reiniciar el servicio Windows.
+//   - Restart explícito — IPC RESTART_CONNECTION llama RequestRestart()
+//     en el cliente SSE actual; el inner loop reconecta inmediato.
+//   - Reconnect con backoff — el sse.Client maneja desconexiones de red
+//     internamente, no tocamos eso.
 //
 // Side-effects:
-//   - Publica estado en runner.Snapshot() (consultado por el IPC server).
-//   - Levanta el IPC server en \\.\pipe\NovaSoftAgent (best-effort: si
-//     falla se loggea pero el runner sigue — la impresión es prioritaria
-//     sobre la diagnóstica).
+//   - Publica estado en runner.Snapshot() (consultado por IPC GetStatus).
+//   - Levanta el IPC server en \\.\pipe\NovaSoftAgent una sola vez al
+//     arranque — sobrevive re-pairs y re-conexiones.
 //
-// Los errores devueltos preservan errors.Is(config.ErrNotConfigured)
-// para que el caller distinga "no emparejado" de otros fallos.
+// El IPC server se considera obligatorio en producción para que el tray
+// pueda hablar con el servicio. Si falla al arrancar (pipe ya en uso,
+// SDDL inválida, etc.), lo logueamos pero seguimos — la impresión core
+// funciona sin IPC, solo el tray queda ciego.
 func Run(ctx context.Context) error {
-	// Reset al arranque para no arrastrar estado de runs anteriores
-	// dentro del mismo proceso (caso del servicio: Stop+Start sin morir).
 	Reset()
 
-	cfg, err := config.Load()
-	if err != nil {
-		if errors.Is(err, config.ErrNotConfigured) {
-			return fmt.Errorf("no hay configuración — ejecuta 'novasoft-agent.exe pair' primero")
+	// IPC server arranca UNA vez y sobrevive todas las iteraciones
+	// del config loop. Sin esto, un re-pair tumbaría el IPC y el tray
+	// vería "servicio no responde" durante el reset — UX feo.
+	go func() {
+		handlers := ipc.Handlers{
+			GetStatus: getStatusHandler,
+			Restart:   RequestRestartCurrent,
+			Pair: func(code, backendURL string) (string, error) {
+				resp, err := PairAndApply(code, backendURL)
+				if err != nil {
+					return "", err
+				}
+				return resp.AgentID, nil
+			},
 		}
-		return err
+		if err := ipc.Serve(ctx, handlers); err != nil {
+			log.Printf("⚠ IPC server no pudo arrancar: %v", err)
+		}
+	}()
+
+	stop := ctx.Done()
+	for {
+		select {
+		case <-stop:
+			log.Println("✓ Runner terminado (ctx cancelado).")
+			return nil
+		default:
+		}
+
+		// Limpiar señales pendientes antes de leer config — evita
+		// reset spurious si el usuario hizo pair y luego ctx cancel.
+		drainConfigChanged()
+
+		cfg, err := config.Load()
+		if err != nil {
+			if errors.Is(err, config.ErrNotConfigured) {
+				log.Println("→ sin config: esperando emparejamiento desde el tray o CLI…")
+				SetConnected(false)
+				SetIdentity("", "")
+				SetPrinter("")
+				if !waitForConfigChanged(stop) {
+					log.Println("✓ Runner terminado (ctx cancelado durante espera).")
+					return nil
+				}
+				log.Println("→ config detectado, recargando…")
+				continue
+			}
+			return err
+		}
+
+		// Tenemos config — corre el inner loop que abre SSE.
+		// El inner loop sale cuando:
+		//   - ctx cancelado (servicio detiéndose) → retornamos.
+		//   - configChangedCh señalado (re-pair) → continue para reload.
+		if err := runWithConfig(ctx, cfg); err != nil {
+			log.Printf("⚠ ciclo SSE termino con error: %v", err)
+		}
+
+		if ctx.Err() != nil {
+			log.Println("✓ Runner terminado.")
+			return nil
+		}
+		// Si llegamos acá sin ctx.Err es porque configChanged disparó
+		// el reset — loop iteración para releer config.
 	}
+}
+
+// runWithConfig ejecuta una iteración con un config válido: detecta
+// impresora, abre SSE, procesa jobs hasta ctx cancel o configChanged.
+// Retornar error fatal solo en errores pre-conexión (no impresora);
+// errores de SSE se manejan internamente con backoff.
+func runWithConfig(ctx context.Context, cfg *config.Config) error {
 	SetIdentity(cfg.AgentID, cfg.BackendURL)
 
 	printers, err := printer.ListSystem()
@@ -60,7 +135,15 @@ func Run(ctx context.Context) error {
 		return fmt.Errorf("listando impresoras: %w", err)
 	}
 	if len(printers) == 0 {
-		return fmt.Errorf("no hay impresoras instaladas en Windows — instala el driver primero")
+		log.Println("⚠ no hay impresoras instaladas; reintentando en 30s")
+		// No abortar — el usuario puede conectar la impresora después.
+		// Esperamos un poco y dejamos al outer loop reintentar.
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(30 * time.Second):
+			return nil
+		}
 	}
 
 	log.Println("Impresoras detectadas:")
@@ -89,46 +172,48 @@ func Run(ctx context.Context) error {
 		SetConnected(false)
 	}
 
-	// Levantar IPC en background. Si falla (pipe ya en uso, permission
-	// denied), loguear y seguir — la impresión funciona sin IPC, solo
-	// el tray no podrá mostrar estado.
+	// Publicar el cliente activo para que el IPC RestartConnection
+	// pueda llamar RequestRestart() en él.
+	setCurrentClient(client)
+	defer setCurrentClient(nil)
+
+	// Child ctx que se cancela ya sea por ctx outer (shutdown del
+	// servicio) o por configChanged (re-pair en caliente).
+	innerCtx, innerCancel := context.WithCancel(ctx)
+	defer innerCancel()
+
+	// Watcher: si configChanged, cancelar innerCtx para que el SSE
+	// salga y el outer loop relea el config.
 	go func() {
-		handlers := buildIPCHandlers(client)
-		if err := ipc.Serve(ctx, handlers); err != nil {
-			log.Printf("⚠ IPC server no pudo arrancar: %v", err)
+		select {
+		case <-innerCtx.Done():
+			return
+		case <-configChangedCh:
+			log.Println("→ config cambió, cerrando SSE actual para recargar")
+			innerCancel()
 		}
 	}()
 
-	client.RunWithReconnect(ctx)
-
-	log.Println("✓ Runner terminado.")
+	client.RunWithReconnect(innerCtx)
 	return nil
 }
 
-// buildIPCHandlers construye los callbacks que el IPC server invoca
-// por cada comando. El runner los expone vía closures sobre el sse.Client
-// y el state package-level.
-func buildIPCHandlers(client *sse.Client) ipc.Handlers {
-	return ipc.Handlers{
-		GetStatus: func() ipc.StatusResponse {
-			connected, agentID, backendURL, printerName, lastJobAt := Snapshot()
-			lastJobStr := ""
-			if !lastJobAt.IsZero() {
-				lastJobStr = lastJobAt.UTC().Format("2006-01-02T15:04:05Z")
-			}
-			return ipc.StatusResponse{
-				Connected:   connected,
-				AgentID:     agentID,
-				BackendURL:  backendURL,
-				Version:     AgentVersion,
-				LastJobAt:   lastJobStr,
-				PrinterName: printerName,
-			}
-		},
-		Restart: func() error {
-			client.RequestRestart()
-			return nil
-		},
+// getStatusHandler construye el snapshot que el IPC GetStatus retorna.
+// Vive separado de Run() porque el IPC server arranca antes del primer
+// runWithConfig — necesita ser callable aún sin client activo.
+func getStatusHandler() ipc.StatusResponse {
+	connected, agentID, backendURL, printerName, lastJobAt := Snapshot()
+	lastJobStr := ""
+	if !lastJobAt.IsZero() {
+		lastJobStr = lastJobAt.UTC().Format("2006-01-02T15:04:05Z")
+	}
+	return ipc.StatusResponse{
+		Connected:   connected,
+		AgentID:     agentID,
+		BackendURL:  backendURL,
+		Version:     AgentVersion,
+		LastJobAt:   lastJobStr,
+		PrinterName: printerName,
 	}
 }
 

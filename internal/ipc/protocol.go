@@ -36,11 +36,47 @@ const (
 	// reabrir la conexión. Útil si el agent quedó en backoff largo y
 	// el admin sabe que la red ya volvió.
 	CmdRestartConnection = "RESTART_CONNECTION"
+
+	// CmdPair empareja el agent contra un restaurant usando el código
+	// generado por el wizard NovaSoft. El payload del Request lleva
+	// PairRequest (code + backend_url opcional). El servidor:
+	//   1. Valida + normaliza el código (NormalizeCode acepta con/sin
+	//      guiones, mayús/minús).
+	//   2. Hace POST {backend}/printing/agents/pair (handshake).
+	//   3. Guarda config.json en %PROGRAMDATA%\NovaSoft\.
+	//   4. Notifica al runner para que reinicie el SSE con el token
+	//      nuevo (sin reiniciar el servicio Windows).
+	//
+	// Re-pair sobre un agent ya emparejado: sobrescribe el config viejo;
+	// el HMAC anterior queda colgado del lado servidor (admin debe
+	// borrarlo manual desde NovaOps si quiere limpiar).
+	CmdPair = "PAIR"
 )
 
 // Request es la unidad de mensaje entrante al servidor IPC.
+//
+// Payload es opcional — comandos sin parámetros (GetStatus,
+// RestartConnection) lo dejan nil. Comandos con parámetros (Pair)
+// llevan un sub-tipo serializado a JSON ahí.
 type Request struct {
-	Command string `json:"command"`
+	Command string          `json:"command"`
+	Payload json.RawMessage `json:"payload,omitempty"`
+}
+
+// PairRequest es el payload del Request cuando Command == CmdPair.
+// Code es obligatorio. BackendURL es opcional — vacío usa el default
+// del servidor (https://api.novasoft.mx).
+type PairRequest struct {
+	Code       string `json:"code"`
+	BackendURL string `json:"backend_url,omitempty"`
+}
+
+// PairResponseData es el payload de Data en la Response cuando el
+// pair fue exitoso. Refleja un subset del PairResponse del backend
+// que es útil para el cliente (tray) — el agent_token completo NO
+// se incluye, queda guardado en config.json del lado del servidor.
+type PairResponseData struct {
+	AgentID string `json:"agent_id"`
 }
 
 // Response es la unidad de mensaje saliente. Si Error está set, OK es

@@ -97,3 +97,70 @@ func RestartConnection() error {
 	}
 	return nil
 }
+
+// Pair le pide al servicio que ejecute el handshake de pair con el
+// código provisto. backendURL puede ser vacío — el servicio usa su
+// default (api.novasoft.mx).
+//
+// Devuelve el agent_id devuelto por el backend en caso de éxito.
+// Errores típicos vienen como string en err: "código inválido",
+// "código expirado", "no pude conectar con el servidor".
+//
+// Read timeout extendido a 20s porque el handshake hace round-trip
+// HTTP a api.novasoft.mx — más lento que un GET_STATUS local.
+func Pair(code, backendURL string) (string, error) {
+	payload, err := json.Marshal(PairRequest{Code: code, BackendURL: backendURL})
+	if err != nil {
+		return "", fmt.Errorf("marshal pair payload: %w", err)
+	}
+
+	resp, err := callWithTimeout(
+		Request{Command: CmdPair, Payload: payload},
+		dialTimeout,
+		20*time.Second,
+	)
+	if err != nil {
+		return "", err
+	}
+	if !resp.OK {
+		return "", fmt.Errorf("%s", resp.Error)
+	}
+	var data PairResponseData
+	if err := json.Unmarshal(resp.Data, &data); err != nil {
+		return "", fmt.Errorf("decode pair response: %w", err)
+	}
+	return data.AgentID, nil
+}
+
+// callWithTimeout es como Call pero con timeouts custom. Existe porque
+// Pair necesita más read budget que GetStatus (handshake remoto).
+func callWithTimeout(req Request, dial, read time.Duration) (*Response, error) {
+	conn, err := winio.DialPipe(PipeName, &dial)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrServiceUnavailable, err)
+	}
+	defer conn.Close()
+
+	_ = conn.SetDeadline(time.Now().Add(read))
+
+	data, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("marshal request: %w", err)
+	}
+	data = append(data, '\n')
+	if _, err := conn.Write(data); err != nil {
+		return nil, fmt.Errorf("write request: %w", err)
+	}
+
+	reader := bufio.NewReader(conn)
+	line, err := reader.ReadBytes('\n')
+	if err != nil {
+		return nil, fmt.Errorf("read response: %w", err)
+	}
+
+	var resp Response
+	if err := json.Unmarshal(line, &resp); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	return &resp, nil
+}

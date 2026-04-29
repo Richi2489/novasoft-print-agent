@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"log"
 	"os/exec"
+	"strings"
 	"time"
 
 	"fyne.io/systray"
@@ -48,12 +49,13 @@ const pollInterval = 3 * time.Second
 // Items del menú declarados como package vars para que el goroutine de
 // poll los pueda actualizar y el de clicks los pueda escuchar.
 var (
-	statusItem        *systray.MenuItem
-	lastActivityItem  *systray.MenuItem
-	restartItem       *systray.MenuItem
-	logsItem          *systray.MenuItem
-	aboutItem         *systray.MenuItem
-	quitItem          *systray.MenuItem
+	statusItem       *systray.MenuItem
+	lastActivityItem *systray.MenuItem
+	pairItem         *systray.MenuItem
+	restartItem      *systray.MenuItem
+	logsItem         *systray.MenuItem
+	aboutItem        *systray.MenuItem
+	quitItem         *systray.MenuItem
 
 	// lastStatus guarda el último estado conocido para que el handler
 	// de "Acerca de" tenga datos sin hacer un llamado IPC extra.
@@ -77,7 +79,8 @@ func onReady() {
 
 	systray.AddSeparator()
 
-	// Items de acción.
+	// Items de acción. Orden importa — los más usados arriba.
+	pairItem = systray.AddMenuItem("Emparejar…", "Pegar el código generado en NovaSoft para conectar el agent")
 	restartItem = systray.AddMenuItem("Reiniciar conexión", "Forzar al agent a reconectarse al servidor")
 	logsItem = systray.AddMenuItem("Abrir logs", "Abrir agent.log en el editor por defecto")
 	aboutItem = systray.AddMenuItem("Acerca de NovaSoft Agent", "Información de versión y configuración")
@@ -156,6 +159,8 @@ func updateStatus() {
 func clickLoop() {
 	for {
 		select {
+		case <-pairItem.ClickedCh:
+			handlePair()
 		case <-restartItem.ClickedCh:
 			handleRestart()
 		case <-logsItem.ClickedCh:
@@ -167,6 +172,110 @@ func clickLoop() {
 			return
 		}
 	}
+}
+
+// handlePair muestra un InputBox de Windows pidiendo el código de
+// emparejamiento, lo manda al servicio vía IPC, y muestra el resultado.
+//
+// Flujo:
+//  1. Pre-check: si el servicio no responde, mostrar error inmediato.
+//     Evita que el usuario pierda el código en un dialog que iba a
+//     fallar de cualquier manera.
+//  2. Levantar PowerShell con [Microsoft.VisualBasic.Interaction]::InputBox.
+//     PowerShell devuelve el string a stdout; lo capturamos.
+//  3. Validar localmente que no esté vacío (cancelado).
+//  4. IPC.Pair(code, ""). El servicio usa su default backend.
+//  5. Mostrar éxito o error en MessageBox.
+//  6. Forzar refresh inmediato del status para que el usuario vea
+//     el icono pasar a verde sin esperar el polling.
+func handlePair() {
+	// 1. Pre-check del servicio antes de pedir el código al usuario.
+	if _, err := ipc.GetStatus(); err != nil {
+		_ = showMessageBox(
+			"NovaSoft Print Agent",
+			"El servicio no está respondiendo. Verifica que NovaSoft Print Agent "+
+				"esté corriendo en services.msc, o reinicia tu computadora.",
+		)
+		return
+	}
+
+	// 2. Pedir el código vía PowerShell InputBox.
+	code, cancelled, err := promptForPairingCode()
+	if err != nil {
+		log.Printf("⚠ pair prompt: %v", err)
+		_ = showMessageBox(
+			"NovaSoft Print Agent",
+			fmt.Sprintf("No pude abrir el cuadro de diálogo: %v", err),
+		)
+		return
+	}
+	if cancelled || code == "" {
+		// Usuario canceló — silencioso, no es un error.
+		return
+	}
+
+	// 3. Llamar IPC PAIR. backendURL vacío → servicio usa su default.
+	agentID, err := ipc.Pair(code, "")
+	if err != nil {
+		log.Printf("⚠ pair fallo: %v", err)
+		_ = showMessageBox(
+			"Emparejamiento fallido",
+			fmt.Sprintf("No pude emparejar el agent:\n\n%s\n\n"+
+				"Verifica el código en NovaSoft (puede haber expirado) e intenta de nuevo.", err),
+		)
+		return
+	}
+
+	// 4. Éxito — mostrar confirmación.
+	log.Printf("✓ pair exitoso: agent_id=%s", agentID)
+	_ = showMessageBox(
+		"Emparejamiento exitoso",
+		fmt.Sprintf("El agent quedó conectado a NovaSoft.\n\nAgent ID: %s\n\n"+
+			"En unos segundos verás el icono cambiar a verde.", abbreviate(agentID, 16)),
+	)
+
+	// 5. Refresh inmediato del status para feedback visual rápido.
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		updateStatus()
+	}()
+}
+
+// promptForPairingCode levanta una ventana modal de Windows pidiendo
+// el código. Devuelve (code, cancelled, error).
+//
+// Implementación: PowerShell + Microsoft.VisualBasic.Interaction.InputBox.
+// El stdout del proceso es directamente el string ingresado (o vacío
+// si el usuario canceló).
+//
+// Por qué no Win32 directo (MessageBoxA con input): MessageBoxA no
+// soporta input. Habría que usar CreateWindow + edit control, lo cual
+// requiere bastante código Win32. PowerShell es one-liner.
+func promptForPairingCode() (code string, cancelled bool, err error) {
+	// El script de PowerShell usa newline literal (CRLF de Go) en
+	// lugar de los escapes `r`n` de PowerShell. PowerShell interpreta
+	// los newlines reales del string como salto de línea cuando se
+	// pasan a InputBox. Esto evita el clash con Go raw strings (que
+	// no pueden contener backticks).
+	script := "Add-Type -AssemblyName Microsoft.VisualBasic; " +
+		"$result = [Microsoft.VisualBasic.Interaction]::InputBox(" +
+		"'Pega el codigo de emparejamiento (formato ABCD-1234-WXYZ).', " +
+		"'NovaSoft Print Agent - Emparejar', " +
+		"''); " +
+		"[Console]::Out.Write($result)"
+
+	cmd := exec.Command("powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", script)
+	out, err := cmd.Output()
+	if err != nil {
+		return "", false, err
+	}
+	code = strings.TrimSpace(string(out))
+	if code == "" {
+		// PowerShell InputBox devuelve "" si Cancel o si el campo
+		// quedó vacío. Para nosotros ambos casos son "no procesar".
+		return "", true, nil
+	}
+	return code, false, nil
 }
 
 func handleRestart() {

@@ -94,7 +94,9 @@ jobs:
             Write-Error "iscc fallo con exit code $LASTEXITCODE"
             exit $LASTEXITCODE
           }
-          $setupExe = "dist\installer\NovaSoftAgentSetup-${{ steps.version.outputs.VERSION }}.exe"
+          # OutputBaseFilename del .iss es "NovaSoftAgentSetup" (sin
+          # sufijo de version) — URL stable releases/latest/download/...
+          $setupExe = "dist\installer\NovaSoftAgentSetup.exe"
           if (-not (Test-Path $setupExe)) {
             Write-Error "Setup exe no se genero en $setupExe"
             exit 1
@@ -104,11 +106,10 @@ jobs:
       - name: Generate SHA256SUMS
         shell: pwsh
         run: |
-          $version = "${{ steps.version.outputs.VERSION }}"
           $files = @(
             "dist\windows\novasoft-agent.exe",
             "dist\windows\novasoft-tray.exe",
-            "dist\installer\NovaSoftAgentSetup-$version.exe"
+            "dist\installer\NovaSoftAgentSetup.exe"
           )
           $sums = foreach ($f in $files) {
             $hash = (Get-FileHash -Algorithm SHA256 $f).Hash.ToLower()
@@ -138,9 +139,8 @@ jobs:
 
             ### Descarga recomendada
 
-            **`NovaSoftAgentSetup-${{ steps.version.outputs.VERSION }}.exe`** — instalador
-            con wizard que configura el servicio Windows + tray icon en
-            un solo paso.
+            **`NovaSoftAgentSetup.exe`** — instalador con wizard que
+            configura el servicio Windows + tray icon en un solo paso.
 
             Tambien disponibles para escenarios avanzados:
 
@@ -152,7 +152,7 @@ jobs:
             ### Verificacion de integridad
 
             ```powershell
-            Get-FileHash -Algorithm SHA256 NovaSoftAgentSetup-${{ steps.version.outputs.VERSION }}.exe
+            Get-FileHash -Algorithm SHA256 NovaSoftAgentSetup.exe
             ```
 
             Compara contra `SHA256SUMS.txt` adjunto a este release.
@@ -168,7 +168,7 @@ jobs:
           files: |
             dist/windows/novasoft-agent.exe
             dist/windows/novasoft-tray.exe
-            dist/installer/NovaSoftAgentSetup-${{ steps.version.outputs.VERSION }}.exe
+            dist/installer/NovaSoftAgentSetup.exe
             dist/SHA256SUMS.txt
           fail_on_unmatched_files: true
           # generate_release_notes agrega "What's Changed" + "New Contributors"

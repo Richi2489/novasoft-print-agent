@@ -62,6 +62,12 @@ func main() {
 	// aun cuando el binary tenga una versión inyectada por -ldflags.
 	runner.AgentVersion = Version
 
+	// Default backend para el flow de pair desde IPC (tray). Sin esto
+	// runner.PairAndApply usa un fallback hardcoded — sincronizar con
+	// la const de este archivo evita drift si cambiamos uno y olvidamos
+	// el otro.
+	runner.SetDefaultBackend(DefaultBackendURL)
+
 	// Detectar modo de ejecución antes de cualquier otra cosa.
 	// service.Interactive() retorna false cuando el binary fue lanzado
 	// por el SCM de Windows (sin terminal, sin args). En ese caso
