@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
@@ -72,6 +73,14 @@ type Client struct {
 	// connectAndServe actual a salir y dispararse un reconnect inmediato.
 	// Buffer 1 — múltiples requests son colapsadas en un solo restart.
 	restartCh chan struct{}
+
+	// restartRequested se setea a true por RequestRestart antes de
+	// señalar restartCh, y a false por el loop principal después de
+	// honrar el restart. Necesario porque la goroutine watcher consume
+	// restartCh para cancelar el connCtx — el loop principal no puede
+	// peek en el canal después, así que usa este flag para distinguir
+	// "salí por restart explícito" vs "salí por error de red".
+	restartRequested atomic.Bool
 }
 
 // New construye un Client. BackendURL puede tener trailing slash o no;
@@ -117,7 +126,12 @@ func New(backendURL, token string) *Client {
 // Uso típico: el IPC handler "RESTART_CONNECTION" lo invoca cuando el
 // admin presiona "Reiniciar" en el tray. Útil cuando el agent quedó en
 // backoff largo (>30s) y el admin sabe que la red ya volvió.
+//
+// Sets restartRequested=true antes de señalar el canal, para que el
+// loop principal pueda detectar "fue restart" aún cuando la goroutine
+// watcher ya consumió el canal.
 func (c *Client) RequestRestart() {
+	c.restartRequested.Store(true)
 	select {
 	case c.restartCh <- struct{}{}:
 	default:
@@ -130,13 +144,26 @@ func (c *Client) RequestRestart() {
 //
 // Soporta restart explícito vía RequestRestart(): cierra la conexión
 // actual y reintenta inmediatamente sin respetar el backoff acumulado
-// (resetea el backoff a su intervalo inicial).
+// (resetea el backoff a su intervalo inicial). El restart durante
+// backoff sleep también acelera — en lugar de esperar el wait
+// completo, el sleep se cancela y reconecta inmediato.
+//
+// Detección "fue restart" usa restartRequested atomic.Bool — la goroutine
+// watcher consume restartCh para cancelar el connCtx, así que el loop
+// principal no puede peek en el canal después. El flag preserva la
+// info "alguien pidió restart" entre la cancelación y el chequeo.
 func (c *Client) RunWithReconnect(ctx context.Context) {
 	b := backoff.NewExponentialBackOff()
 	b.InitialInterval = reconnectInitial
 	b.MaxInterval = reconnectMax
 	b.MaxElapsedTime = 0
 	b.Reset()
+
+	// Limpiar señales viejas que pudieran haber quedado de un Run
+	// anterior (caso runner refactor v0.3.0+: el client se reusa
+	// entre re-pairs si quedara algún design así en el futuro).
+	c.restartRequested.Store(false)
+	drainRestartCh(c.restartCh)
 
 	for {
 		select {
@@ -172,17 +199,29 @@ func (c *Client) RunWithReconnect(ctx context.Context) {
 		}
 
 		// Si el cierre fue por restart explícito, resetear backoff
-		// y reintentar inmediatamente (skip el wait).
-		if drained := drainRestart(c.restartCh); drained {
+		// y reintentar inmediatamente (skip el wait). Swap garantiza
+		// que la próxima iteración no piense que también fue restart.
+		if c.restartRequested.Swap(false) {
+			log.Println("→ honrando restart: reset backoff + reconnect inmediato")
 			b.Reset()
+			drainRestartCh(c.restartCh) // por si se duplicó
 			continue
 		}
 
 		if err != nil {
 			wait := b.NextBackOff()
 			log.Printf("⚠️  desconectado (%v); reintento en %v", err, wait)
+			// Esperar el backoff PERO permitir que un restart durante
+			// el sleep acelere la reconexión. Útil cuando el admin
+			// click "Reiniciar" mientras estamos en mid-backoff (ej.
+			// red volvió y queremos reconnect ya).
 			select {
 			case <-time.After(wait):
+				// Backoff completo — siguiente attempt usa next backoff.
+			case <-c.restartCh:
+				log.Println("→ restart durante backoff: reset y reconnect inmediato")
+				c.restartRequested.Store(false)
+				b.Reset()
 			case <-ctx.Done():
 				return
 			}
@@ -193,15 +232,12 @@ func (c *Client) RunWithReconnect(ctx context.Context) {
 	}
 }
 
-// drainRestart consume cualquier señal de restart pendiente y devuelve
-// true si la había. Permite que el loop diferencie "salí por restart
-// explícito" vs "salí por error de red".
-func drainRestart(ch <-chan struct{}) bool {
+// drainRestartCh consume cualquier señal pendiente del canal sin
+// bloquear. Usado para limpiar estado entre iteraciones del loop.
+func drainRestartCh(ch <-chan struct{}) {
 	select {
 	case <-ch:
-		return true
 	default:
-		return false
 	}
 }
 

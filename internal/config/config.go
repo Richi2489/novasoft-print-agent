@@ -76,7 +76,20 @@ func Load() (*Config, error) {
 
 	data, err := os.ReadFile(path)
 	if err == nil {
-		return parseConfig(data, path)
+		cfg, err := parseConfig(data, path)
+		if err != nil {
+			return nil, err
+		}
+		// Auto-fix de URL Railway legacy aún en configs ya migrados —
+		// cubre RichiLap (que migró en testing v0.3.0 antes del fix)
+		// y cualquier otro caso donde un cliente pre-fix tenga el
+		// config en %PROGRAMDATA% con URL stale.
+		if maybeFixLegacyBackendURL(cfg) {
+			if err := Save(cfg); err != nil {
+				log.Printf("⚠ no pude persistir el rewrite de backend URL: %v", err)
+			}
+		}
+		return cfg, nil
 	}
 	if !os.IsNotExist(err) {
 		return nil, fmt.Errorf("leyendo config: %w", err)
@@ -95,6 +108,19 @@ func Load() (*Config, error) {
 	return cfg, nil
 }
 
+// maybeFixLegacyBackendURL aplica el rewrite Railway → api.novasoft.mx
+// si el cfg viene apuntando al URL Railway directo. Devuelve true si
+// modificó el cfg (caller debe Save). String-match exacto: URLs custom
+// (preview deploys, tests internos) son preservadas.
+func maybeFixLegacyBackendURL(cfg *Config) bool {
+	if cfg.BackendURL == LegacyRailwayBackendURL {
+		log.Printf("✓ config: backend URL actualizado de Railway directo a %s", CurrentBackendURL)
+		cfg.BackendURL = CurrentBackendURL
+		return true
+	}
+	return false
+}
+
 // parseConfig deserializa los bytes del archivo y valida campos
 // obligatorios. El path se usa solo para mensajes de error.
 func parseConfig(data []byte, path string) (*Config, error) {
@@ -111,10 +137,25 @@ func parseConfig(data []byte, path string) (*Config, error) {
 	return &cfg, nil
 }
 
+// LegacyRailwayBackendURL es la URL directa que clientes v0.2.x tenían
+// hardcoded como DefaultBackendURL. F-002 sprint agregó TrustedHostMiddleware
+// al backend que rechaza esta URL con HTTP 400 — los clientes v0.2.x se
+// quedan en retry loop infinito post-upgrade si no se rewrites.
+const LegacyRailwayBackendURL = "https://novasoft-backend-production.up.railway.app"
+
+// CurrentBackendURL es el dominio canónico (paso por TrustedHostMiddleware).
+// Debe coincidir con DefaultBackendURL en cmd/agent/main.go.
+const CurrentBackendURL = "https://api.novasoft.mx"
+
 // tryMigrateLegacy busca un config v0.2.x en la ruta vieja y lo copia a
 // la ruta nueva (v0.3.0+). Devuelve (cfg, true, nil) si migró
 // exitosamente, (nil, false, nil) si no hay config legacy, o
 // (nil, false, err) si encontró el archivo pero no pudo procesarlo.
+//
+// Side-effect importante: si el config legacy tiene BackendURL =
+// LegacyRailwayBackendURL, se reescribe a CurrentBackendURL antes de
+// guardar. Esto repara automáticamente el upgrade-path roto desde
+// F-002 (TrustedHostMiddleware rechaza la URL Railway directa).
 //
 // Si la migración a la ruta nueva falla (ej. permission denied porque
 // %PROGRAMDATA% no es writable como el usuario actual), devolvemos
@@ -136,6 +177,11 @@ func tryMigrateLegacy() (*Config, bool, error) {
 	if err != nil {
 		return nil, false, err
 	}
+
+	// Auto-fix de URL Railway legacy → api.novasoft.mx (helper
+	// compartido con Load para que clientes ya migrados también
+	// reciban el rewrite).
+	maybeFixLegacyBackendURL(cfg)
 
 	// Best-effort: copiar a la ubicación nueva. Si falla (ej. el usuario
 	// interactivo no es admin y %PROGRAMDATA%\NovaSoft\ no existe ni
