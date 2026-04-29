@@ -57,6 +57,11 @@ var Version = "0.3.0-dev"
 const DefaultBackendURL = "https://api.novasoft.mx"
 
 func main() {
+	// Propagar Version al runner para que el IPC StatusResponse la
+	// reporte. Sin esto, el tray vería "0.3.0-dev" hardcoded del runner
+	// aun cuando el binary tenga una versión inyectada por -ldflags.
+	runner.AgentVersion = Version
+
 	// Detectar modo de ejecución antes de cualquier otra cosa.
 	// service.Interactive() retorna false cuando el binary fue lanzado
 	// por el SCM de Windows (sin terminal, sin args). En ese caso

@@ -51,10 +51,27 @@ type Client struct {
 	// para tests).
 	OnPrintJob func(*PrintJob)
 
+	// OnConnected se invoca cuando el handshake SSE completa. Se llama
+	// cada vez que reconecta (no solo la primera vez). Puede ser nil.
+	// El callback corre en la goroutine del read-loop — debe ser barato
+	// y NO bloquear (un mutex+set de un flag está bien; abrir un nuevo
+	// HTTP request adentro NO).
+	OnConnected func()
+
+	// OnDisconnected se invoca cuando el read-loop sale, ya sea por
+	// error o por context cancel. err es non-nil si fue por error. Puede
+	// ser nil. Mismas restricciones de bloqueo que OnConnected.
+	OnDisconnected func(err error)
+
 	// http es reusable entre reconexiones. Sin timeout en el client
 	// mismo — los timeouts van en contexto o en request individual,
 	// porque el stream GET debe quedarse abierto indefinidamente.
 	http *http.Client
+
+	// restartCh es señalado por RequestRestart para forzar al
+	// connectAndServe actual a salir y dispararse un reconnect inmediato.
+	// Buffer 1 — múltiples requests son colapsadas en un solo restart.
+	restartCh chan struct{}
 }
 
 // New construye un Client. BackendURL puede tener trailing slash o no;
@@ -89,11 +106,31 @@ func New(backendURL, token string) *Client {
 			Timeout:   0, // EXPLÍCITO — los stream son long-lived.
 			Transport: transport,
 		},
+		restartCh: make(chan struct{}, 1),
+	}
+}
+
+// RequestRestart pide al runloop que cierre la conexión SSE actual y
+// reabra inmediatamente. Llamadas concurrentes son colapsadas (canal
+// buffer 1) — múltiples requests en rápida sucesión = un solo restart.
+//
+// Uso típico: el IPC handler "RESTART_CONNECTION" lo invoca cuando el
+// admin presiona "Reiniciar" en el tray. Útil cuando el agent quedó en
+// backoff largo (>30s) y el admin sabe que la red ya volvió.
+func (c *Client) RequestRestart() {
+	select {
+	case c.restartCh <- struct{}{}:
+	default:
+		// Ya hay un restart pending — no hace falta encolar otro.
 	}
 }
 
 // RunWithReconnect bloquea hasta ctx.Done(). Cada desconexión dispara
 // backoff antes de reintentar. MaxElapsedTime=0 = infinito.
+//
+// Soporta restart explícito vía RequestRestart(): cierra la conexión
+// actual y reintenta inmediatamente sin respetar el backoff acumulado
+// (resetea el backoff a su intervalo inicial).
 func (c *Client) RunWithReconnect(ctx context.Context) {
 	b := backoff.NewExponentialBackOff()
 	b.InitialInterval = reconnectInitial
@@ -108,13 +145,40 @@ func (c *Client) RunWithReconnect(ctx context.Context) {
 		default:
 		}
 
-		err := c.connectAndServe(ctx)
-		if err != nil {
+		// Child context para la conexión actual — permite cancelar
+		// solo esta sin tumbar el outer ctx (que es lifetime del
+		// runner entero).
+		connCtx, connCancel := context.WithCancel(ctx)
+		// Goroutine que vigila restartCh y cancela connCtx si llega.
+		// Sale cuando connCtx termina (por error o por restart).
+		restartDone := make(chan struct{})
+		go func() {
+			defer close(restartDone)
 			select {
-			case <-ctx.Done():
-				return
-			default:
+			case <-c.restartCh:
+				log.Println("→ restart explícito solicitado, cerrando conexión SSE")
+				connCancel()
+			case <-connCtx.Done():
 			}
+		}()
+
+		err := c.connectAndServe(connCtx)
+		connCancel()
+		<-restartDone
+
+		// Si el outer ctx murió mientras tanto, salimos.
+		if ctx.Err() != nil {
+			return
+		}
+
+		// Si el cierre fue por restart explícito, resetear backoff
+		// y reintentar inmediatamente (skip el wait).
+		if drained := drainRestart(c.restartCh); drained {
+			b.Reset()
+			continue
+		}
+
+		if err != nil {
 			wait := b.NextBackOff()
 			log.Printf("⚠️  desconectado (%v); reintento en %v", err, wait)
 			select {
@@ -126,6 +190,18 @@ func (c *Client) RunWithReconnect(ctx context.Context) {
 		}
 		// connectAndServe retornó sin error → ctx cancelado por shutdown.
 		return
+	}
+}
+
+// drainRestart consume cualquier señal de restart pendiente y devuelve
+// true si la había. Permite que el loop diferencie "salí por restart
+// explícito" vs "salí por error de red".
+func drainRestart(ch <-chan struct{}) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -168,6 +244,14 @@ func (c *Client) connectAndServe(ctx context.Context) error {
 	}
 
 	log.Println("✓ Conectado al servidor NovaSoft")
+	if c.OnConnected != nil {
+		c.OnConnected()
+	}
+	defer func() {
+		if c.OnDisconnected != nil {
+			c.OnDisconnected(nil)
+		}
+	}()
 
 	return c.readLoop(ctx, resp.Body)
 }
