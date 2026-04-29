@@ -1,15 +1,22 @@
 // NovaSoft Print Agent — binary principal.
 //
-// Subcomandos:
-//   pair     Empareja con un restaurante usando un código del wizard.
-//   run      Abre SSE con el backend y procesa jobs.
-//   status   Muestra la config actual y las impresoras detectadas.
-//   unpair   Borra la config local.
-//   version  Imprime la versión.
+// Subcomandos (CLI interactivo):
+//   pair      Empareja con un restaurante usando un código del wizard.
+//   run       Modo standalone: corre el loop directo en la terminal.
+//   status    Muestra config, impresoras detectadas, estado del servicio.
+//   unpair    Borra la config local.
+//   version   Imprime la versión del binary.
 //
-// Uso típico:
-//   novasoft-agent.exe pair        # primera vez
-//   novasoft-agent.exe run         # deja corriendo
+// Subcomandos de servicio Windows (requieren admin):
+//   install   Registra novasoft-agent.exe como servicio Windows.
+//   uninstall Desregistra el servicio (lo detiene si está corriendo).
+//   start     Inicia el servicio ya instalado.
+//   stop      Detiene el servicio.
+//   restart   Stop + start.
+//
+// Cuando el binary es lanzado por el SCM (Service Control Manager),
+// service.Interactive() devuelve false y el binary entra al loop del
+// servicio sin parsear flags ni subcomandos.
 //
 // Transporte: desde v0.2.0 el agent usa SSE (HTTP/1.1 streaming) en
 // lugar de WebSocket. Motivo: Railway+Fastly strippean el header
@@ -21,7 +28,6 @@ package main
 import (
 	"bufio"
 	"context"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -31,24 +37,50 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/kardianos/service"
+
 	"github.com/Richi2489/novasoft-print-agent/internal/config"
+	"github.com/Richi2489/novasoft-print-agent/internal/logfile"
 	"github.com/Richi2489/novasoft-print-agent/internal/pairing"
 	"github.com/Richi2489/novasoft-print-agent/internal/printer"
-	"github.com/Richi2489/novasoft-print-agent/internal/sse"
+	"github.com/Richi2489/novasoft-print-agent/internal/runner"
 )
 
 // Version se inyecta en build vía -ldflags "-X main.Version=vX.Y.Z".
 // El default tiene "-dev" para distinguir un build manual sin ldflags.
-var Version = "0.2.2-dev"
+var Version = "0.3.0-dev"
 
-// DefaultBackendURL se puede sobreescribir con -backend.
-// Apunta al Railway prod — el deploy de producción corre ahí. Si Ricardo
-// deploya a otro proyecto Railway, override con la flag.
-const DefaultBackendURL = "https://novasoft-backend-production.up.railway.app"
+// DefaultBackendURL apunta al dominio custom de NovaSoft. Si Railway
+// migra a otro proyecto/proveedor, el agent emparejado contra
+// api.novasoft.mx sigue funcionando — el dominio es estable. Para
+// preview deploys o troubleshooting, usar -backend=URL.
+const DefaultBackendURL = "https://api.novasoft.mx"
 
 func main() {
-	// Flags globales. Se parsean antes del subcomando para que funcione
-	// "novasoft-agent.exe -backend=X pair".
+	// Detectar modo de ejecución antes de cualquier otra cosa.
+	// service.Interactive() retorna false cuando el binary fue lanzado
+	// por el SCM de Windows (sin terminal, sin args). En ese caso
+	// no parseamos flags y dejamos que el servicio tome control.
+	if !service.Interactive() {
+		// Modo servicio: log a archivo SOLO (no hay stderr útil), y
+		// bloqueamos en s.Run() hasta que SCM pida Stop.
+		if err := logfile.Configure(false); err != nil {
+			// Sin logs el debugging es duro — al menos intentamos
+			// mandar a stderr por si Windows captura algo.
+			fmt.Fprintf(os.Stderr, "configure logging: %v\n", err)
+		}
+		if err := runAsService(); err != nil {
+			log.Fatalf("servicio: %v", err)
+		}
+		return
+	}
+
+	// Modo interactivo: log a archivo + stderr.
+	if err := logfile.Configure(true); err != nil {
+		fmt.Fprintf(os.Stderr, "configure logging: %v\n", err)
+	}
+
+	// Flags globales — útiles antes del subcomando.
 	backendFlag := flag.String("backend", DefaultBackendURL, "URL del backend (ej: https://api.novasoft.mx)")
 	flag.Parse()
 
@@ -82,6 +114,12 @@ func main() {
 		}
 	case "version":
 		fmt.Println(Version)
+	case "install", "uninstall", "start", "stop", "restart":
+		if err := controlService(cmd); err != nil {
+			fmt.Fprintf(os.Stderr, "✗ %s\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("✓ Servicio %s OK\n", cmd)
 	default:
 		fmt.Fprintf(os.Stderr, "comando desconocido: %s\n\n", cmd)
 		usage()
@@ -95,17 +133,26 @@ func usage() {
 Uso:
   novasoft-agent.exe [-backend=URL] <comando>
 
-Comandos:
-  pair     Empareja con un restaurante usando un código del wizard.
-  run      Abre WebSocket con el backend y procesa jobs.
-  status   Muestra la config actual y las impresoras detectadas.
-  unpair   Borra la config local.
-  version  Imprime la versión.
+Comandos de operación:
+  pair       Empareja con un restaurante usando un código del wizard.
+  run        Corre el agent directo en la terminal (no como servicio).
+  status     Muestra la config actual y las impresoras detectadas.
+  unpair     Borra la config local.
+  version    Imprime la versión.
+
+Comandos de servicio Windows (requieren PowerShell como Administrador):
+  install    Registra el agent como servicio Windows (auto-start).
+  uninstall  Desregistra el servicio.
+  start      Inicia el servicio.
+  stop       Detiene el servicio.
+  restart    Stop + start.
 
 Ejemplos:
   novasoft-agent.exe pair
+  novasoft-agent.exe -backend=https://api.novasoft.mx pair
   novasoft-agent.exe run
-  novasoft-agent.exe -backend=https://api.novasoft.mx run
+  novasoft-agent.exe install
+  novasoft-agent.exe start
 `)
 }
 
@@ -146,109 +193,40 @@ func cmdPair(backendURL string) error {
 	fmt.Printf("  Agent ID: %s\n", resp.AgentID)
 	fmt.Printf("  Config:   %s\n", path)
 	fmt.Println()
-	fmt.Println("Ahora ejecuta:")
-	fmt.Println("  novasoft-agent.exe run")
+	fmt.Println("Próximos pasos:")
+	fmt.Println("  Para correr como servicio (recomendado):")
+	fmt.Println("    novasoft-agent.exe install")
+	fmt.Println("    novasoft-agent.exe start")
+	fmt.Println()
+	fmt.Println("  O para correr en terminal (modo legacy):")
+	fmt.Println("    novasoft-agent.exe run")
 	return nil
 }
 
-// cmdRun carga config, detecta impresora, abre SSE, procesa jobs.
+// cmdRun corre el runner standalone con cancel por SIGINT/SIGTERM.
+// Misma lógica que el modo servicio pero con terminal-attached y
+// signal handling para Ctrl-C.
 func cmdRun() error {
-	cfg, err := config.Load()
-	if err != nil {
-		if errors.Is(err, config.ErrNotConfigured) {
-			return fmt.Errorf("no hay configuración — ejecuta 'novasoft-agent.exe pair' primero")
-		}
-		return err
-	}
-
-	// 1. Detectar impresora.
-	printers, err := printer.ListSystem()
-	if err != nil {
-		return fmt.Errorf("listando impresoras: %w", err)
-	}
-	if len(printers) == 0 {
-		return fmt.Errorf("no hay impresoras instaladas en Windows — instala el driver de tu impresora primero")
-	}
-
-	fmt.Println("Impresoras detectadas:")
-	for i, p := range printers {
-		fmt.Printf("  %d. %s\n", i+1, p.Name)
-	}
-
-	selected := printer.SelectThermalPrinter(printers)
-	if selected == nil {
-		return fmt.Errorf("no pude seleccionar una impresora")
-	}
-	fmt.Printf("→ Usando: %s\n", selected.Name)
-	fmt.Println()
-
-	// 2. El endpoint SSE se deriva del BackendURL del config (que el
-	// agent guardó al emparejarse). Ignoramos cfg.WebsocketURL — ese
-	// campo se preserva para back-compat pero en el pivot SSE no lo
-	// usamos; el backend del pair response devuelve un URL informativo
-	// que puede apuntar a un dominio distinto del Railway URL efectivo
-	// (p. ej. api.novasoft.mx sin CNAME).
-	backend := strings.TrimRight(cfg.BackendURL, "/")
-	fmt.Printf("→ Conectando a %s/printing/agents/stream\n", backend)
-
-	// 3. Cliente SSE con callback de impresión.
-	client := sse.New(backend, cfg.AgentToken)
-	// Context cancelable por signal — lo creamos antes del callback para
-	// que handleJob pueda usarlo como parent del POST de reporte.
 	ctx, cancel := signalContext()
 	defer cancel()
 
-	client.OnPrintJob = func(job *sse.PrintJob) {
-		handleJob(ctx, client, selected, job)
+	if err := runner.Run(ctx); err != nil {
+		return err
 	}
 
-	client.RunWithReconnect(ctx)
-
-	fmt.Println()
 	fmt.Println("✓ Agent cerrado.")
 	return nil
-}
-
-// handleJob convierte el payload del job a ESC/POS y lo imprime.
-// Reporta resultado al backend sin fallar el agent — si la impresora
-// está offline, el agent sigue escuchando por si llega el siguiente.
-func handleJob(ctx context.Context, client *sse.Client, p *printer.Printer, job *sse.PrintJob) {
-	log.Printf("📄 Job recibido: %s (%s)", job.ID, job.JobType)
-
-	var payload printer.Payload
-	if err := json.Unmarshal(job.Payload, &payload); err != nil {
-		msg := fmt.Sprintf("payload inválido: %v", err)
-		log.Printf("✗ %s", msg)
-		_ = client.ReportJobResult(ctx, job.ID, "failed", msg)
-		return
-	}
-
-	escposBytes, err := printer.Convert(payload)
-	if err != nil {
-		msg := fmt.Sprintf("conversión ESC/POS: %v", err)
-		log.Printf("✗ %s", msg)
-		_ = client.ReportJobResult(ctx, job.ID, "failed", msg)
-		return
-	}
-
-	if err := printer.SendRaw(p, escposBytes); err != nil {
-		msg := fmt.Sprintf("impresión: %v", err)
-		log.Printf("✗ %s", msg)
-		_ = client.ReportJobResult(ctx, job.ID, "failed", msg)
-		return
-	}
-
-	log.Printf("✓ Impreso: %s", job.ID)
-	_ = client.ReportJobResult(ctx, job.ID, "printed", "")
 }
 
 // cmdStatus imprime info diagnóstica para troubleshoot.
 func cmdStatus() error {
 	cfg, err := config.Load()
-	path, _ := config.Path()
+	cfgPath, _ := config.Path()
+	logPath, _ := logfile.Path()
 
 	fmt.Printf("Version:       %s\n", Version)
-	fmt.Printf("Config path:   %s\n", path)
+	fmt.Printf("Config path:   %s\n", cfgPath)
+	fmt.Printf("Log path:      %s\n", logPath)
 	fmt.Println()
 
 	if err != nil {
@@ -277,8 +255,31 @@ func cmdStatus() error {
 		fmt.Printf("  %d. %s\n", i+1, p.Name)
 	}
 	if selected := printer.SelectThermalPrinter(printers); selected != nil {
-		fmt.Printf("Preferida: %s\n", selected.Name)
+		fmt.Printf("Preferida:     %s\n", selected.Name)
 	}
+
+	// Estado del servicio Windows si está instalado.
+	fmt.Println()
+	fmt.Print("Servicio Windows: ")
+	s, _, sErr := newService()
+	if sErr != nil {
+		fmt.Printf("error inicializando wrapper — %v\n", sErr)
+	} else {
+		st, stErr := s.Status()
+		switch {
+		case errors.Is(stErr, service.ErrNotInstalled):
+			fmt.Println("no instalado (corre 'install')")
+		case stErr != nil:
+			fmt.Printf("error consultando estado — %v\n", stErr)
+		case st == service.StatusRunning:
+			fmt.Println("corriendo ✓")
+		case st == service.StatusStopped:
+			fmt.Println("detenido (corre 'start')")
+		default:
+			fmt.Printf("estado desconocido (%d)\n", st)
+		}
+	}
+
 	return nil
 }
 
