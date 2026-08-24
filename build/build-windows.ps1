@@ -1,4 +1,4 @@
-# NovaSoft Print Agent — build script para Windows amd64.
+﻿# NovaSoft Print Agent — build script para Windows amd64.
 #
 # Uso:
 #   .\build\build-windows.ps1                    # version default v0.4.0
@@ -36,6 +36,11 @@ $env:GOOS = "windows"
 $env:GOARCH = "amd64"
 $env:CGO_ENABLED = "0"
 
+# Flags de build:
+#   -trimpath                  — quita del binary las rutas absolutas de
+#                                  la máquina que compiló. Build
+#                                  reproducible y no filtra el home.
+#
 # ldflags:
 #   -X main.Version=$Version   — inyecta version al binary.
 #   -s -w                      — strip symbol table + DWARF. Reduce
@@ -45,7 +50,7 @@ $ldflags = "-X main.Version=$Version -s -w"
 
 Push-Location $RepoRoot
 try {
-    & go build -ldflags "$ldflags" -o "$OutputExe" ./cmd/agent
+    & go build -trimpath -ldflags "$ldflags" -o "$OutputExe" ./cmd/agent
     if ($LASTEXITCODE -ne 0) {
         Write-Host "" -ForegroundColor Red
         Write-Host "✗ Build fallo con exit code $LASTEXITCODE" -ForegroundColor Red
