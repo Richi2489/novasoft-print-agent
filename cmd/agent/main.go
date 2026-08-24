@@ -54,7 +54,7 @@ import (
 
 // Version se inyecta en build vía -ldflags "-X main.Version=vX.Y.Z".
 // El default tiene "-dev" para distinguir un build manual sin ldflags.
-var Version = "0.3.0-dev"
+var Version = "v0.4.0-dev"
 
 // DefaultBackendURL se puede sobreescribir con -backend.
 // Apunta al Railway prod — el deploy de producción corre ahí. Si Ricardo
