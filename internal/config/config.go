@@ -15,7 +15,7 @@
 //
 // # Ubicación en Windows: por máquina, no por usuario
 //
-// Desde v0.3.0 el agent puede correr como servicio de Windows bajo la
+// Desde v0.4.0 el agent puede correr como servicio de Windows bajo la
 // cuenta LocalSystem. Esa cuenta tiene su propio %APPDATA%
 // (C:\Windows\system32\config\systemprofile\AppData\Roaming), distinto
 // al del usuario que corrió `pair`. Si dejáramos el config en %APPDATA%
