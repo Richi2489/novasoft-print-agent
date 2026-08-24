@@ -48,8 +48,14 @@ el emparejamiento automáticamente.
 
 ## 3 — Empareja el Agent
 
-En la computadora de la caja, abre PowerShell (click derecho al menú
-Inicio → "Windows PowerShell") y ve a la carpeta del agent:
+En la computadora de la caja, abre PowerShell **como administrador**
+(click DERECHO al menú Inicio → "Terminal (Administrador)" o "Windows
+PowerShell (Administrador)") y ve a la carpeta del agent:
+
+> **¿Por qué administrador?** Desde v0.3.0 el emparejamiento se guarda
+> en `C:\ProgramData\NovaSoftAgent\`, un directorio de máquina, para que
+> el servicio de Windows también lo pueda leer. Escribir ahí requiere
+> elevación. Es la única vez que hace falta.
 
 ```
 cd C:\NovaSoftAgent
@@ -78,10 +84,11 @@ Si todo salió bien:
 
 ✓ Emparejado correctamente
   Agent ID: 7f3a...
-  Config:   C:\Users\<tu_usuario>\AppData\Roaming\NovaSoftPrintAgent\config.json
+  Config:   C:\ProgramData\NovaSoftAgent\config.json
 
-Ahora ejecuta:
-  novasoft-agent.exe run
+Ahora instala el servicio para que arranque solo:
+  novasoft-agent.exe service install
+  novasoft-agent.exe service start
 ```
 
 En el wizard de NovaSoft verás que avanzó al **Paso 3** automáticamente.
@@ -93,6 +100,13 @@ Con el emparejamiento hecho, lanza el modo de operación:
 ```
 .\novasoft-agent.exe run
 ```
+
+> Esto lo deja corriendo **en esta ventana**, que es lo ideal para ver
+> que todo funciona la primera vez. Para el uso diario **no dejes el
+> agent así**: instálalo como servicio de Windows (sección "Mantener el
+> agent corriendo al reiniciar la computadora", más abajo). Es un par de
+> comandos y evita que el restaurante se quede sin imprimir si alguien
+> cierra la ventana o la máquina se reinicia.
 
 El agent:
 
@@ -147,10 +161,20 @@ Si el agent está apagado o desconectado, el POS cae al PDF descargable
 | Comando | Qué hace |
 |---|---|
 | `pair` | Empareja usando un código del wizard |
-| `run` | Arranca el loop principal — escucha jobs |
+| `run` | Arranca el loop principal en esta consola — escucha jobs |
+| `service install` | Instala el servicio de Windows (auto + reinicio ante fallo) |
+| `service uninstall` | Detiene y elimina el servicio |
+| `service start` | Arranca el servicio |
+| `service stop` | Detiene el servicio |
+| `service status` | Estado del servicio + ruta del log |
 | `status` | Muestra config + impresoras detectadas |
 | `unpair` | Borra la config local (tras confirmación) |
 | `version` | Imprime la versión |
+
+`run` sirve para los dos modos: cuando lo arranca el Service Control
+Manager de Windows el binario lo detecta solo y se comporta como
+servicio (sin consola, log a archivo); cuando lo escribes tú en una
+consola se comporta como siempre.
 
 Flags globales:
 
@@ -160,7 +184,84 @@ Flags globales:
 
 ## Mantener el agent corriendo al reiniciar la computadora
 
-**Opción A — Acceso directo al inicio** (sencillo):
+### Opción A — Servicio de Windows (RECOMENDADA)
+
+Es la única opción que cumple las tres cosas que un restaurante necesita:
+
+- **Arranca con el equipo**, sin que nadie inicie sesión en Windows.
+  Si la máquina se reinicia de madrugada, a la hora de abrir ya está
+  imprimiendo.
+- **Se reinicia solo si se cae**: Windows lo revive a los 5 s, 5 s y
+  luego cada 30 s, indefinidamente.
+- **No hay ventana que cerrar** por accidente.
+
+#### Instalación
+
+Abre PowerShell **como administrador** (click DERECHO en el menú Inicio
+→ "Terminal (Administrador)" o "Windows PowerShell (Administrador)") y
+ejecuta:
+
+```powershell
+cd C:\NovaSoftAgent
+.\novasoft-agent.exe service install
+.\novasoft-agent.exe service start
+```
+
+Salida esperada de `service install`:
+
+```
+✓ Servicio "NovaSoftPrintAgent" instalado.
+
+  Nombre:      NovaSoftPrintAgent (NovaSoft Print Agent)
+  Ejecutable:  C:\NovaSoftAgent\novasoft-agent.exe run
+  Cuenta:      LocalSystem
+  Arranque:    Automático (con el equipo, sin necesidad de iniciar sesión)
+  Recuperación: reinicio a los 5 s, 5 s y luego cada 30 s
+  Config:      C:\ProgramData\NovaSoftAgent\config.json
+  Log:         C:\ProgramData\NovaSoftAgent\logs\agent.log
+```
+
+#### Confirmar que quedó bien
+
+```powershell
+.\novasoft-agent.exe service status
+```
+
+Tienes que ver `Estado: CORRIENDO` y `Arranque: Automático`. Con las
+herramientas de Windows es lo mismo:
+
+```powershell
+sc query NovaSoftPrintAgent      # STATE debe decir 4  RUNNING
+sc qc NovaSoftPrintAgent         # START_TYPE debe decir 2  AUTO_START
+sc qfailure NovaSoftPrintAgent   # las tres acciones de reinicio
+```
+
+#### Los demás comandos
+
+| Comando | Qué hace | ¿Admin? |
+|---|---|---|
+| `service install` | Crea el servicio (auto + reinicio ante fallo) | Sí |
+| `service uninstall` | Lo detiene y lo elimina | Sí |
+| `service start` | Lo arranca | Sí |
+| `service stop` | Lo detiene | Sí |
+| `service status` | Estado, cuenta, recuperación, ruta del log | No |
+
+#### Si `service install` falla
+
+- **"se requieren permisos de administrador…"** — no abriste PowerShell
+  como administrador. El propio mensaje trae los pasos; repítelos.
+- **"el servicio ... ya está instalado"** — normal si estás
+  actualizando. Ejecuta `service uninstall` y vuelve a instalar.
+- **El servicio arranca y se detiene solo** — casi siempre es que no
+  hay emparejamiento todavía, o que la impresora no está encendida. Mira
+  `C:\ProgramData\NovaSoftAgent\logs\agent.log`; la primera línea de
+  error te lo dice. Empareja (`pair`) y luego `service start`.
+
+### Opción B — Acceso directo al inicio (solo si no puedes usar el servicio)
+
+Sirve si el equipo no te deja instalar servicios. **Tiene las tres
+limitaciones que la opción A resuelve**: no arranca sin login, nadie lo
+levanta si se cae, y cerrar la ventana lo mata.
 
 1. `Win + R` → `shell:startup` → Enter.
 2. Crea un acceso directo a `novasoft-agent.exe` en esa carpeta.
@@ -172,17 +273,65 @@ Flags globales:
 4. Aplicar. La próxima vez que el usuario inicie sesión, el agent
    arranca automáticamente.
 
-**Opción B — Windows Service** llegará en un sprint posterior.
+## Dónde viven la config y los logs
+
+| Qué | Ruta |
+|---|---|
+| Config (token) | `C:\ProgramData\NovaSoftAgent\config.json` |
+| Log del agent | `C:\ProgramData\NovaSoftAgent\logs\agent.log` |
+| Logs rotados | `agent.log.1` … `agent.log.3` (5 MB cada uno) |
+| Eventos del servicio | Visor de eventos → Registros de Windows → Aplicación → origen `NovaSoftPrintAgent` |
+
+`C:\ProgramData` es un directorio **de máquina**, no de usuario. Es
+deliberado: el servicio corre como `LocalSystem` y esa cuenta no ve el
+`%APPDATA%` de la persona que hizo `pair`. Si dejáramos el config donde
+estaba antes (`%APPDATA%\NovaSoftPrintAgent`), el servicio nunca lo
+encontraría.
+
+**Si vienes de una versión anterior (≤ v0.2.2) no tienes que volver a
+emparejar**: la primera vez que corras cualquier comando —y
+explícitamente durante `service install`— el agent copia el config viejo
+a la ruta nueva. El archivo viejo se deja donde está, por si necesitas
+volver a la versión anterior.
 
 ## Solución de problemas
 
 ### "no hay configuración — ejecuta 'pair' primero"
 
-El agent no encuentra `config.json`. Causas:
+El agent no encuentra `config.json` en
+`C:\ProgramData\NovaSoftAgent\`. Causas:
 - No has hecho `pair` todavía.
 - Borraste el config con `unpair`.
-- Estás ejecutando el agent con un usuario de Windows distinto al que
-  hizo el `pair` (cada usuario tiene su propio `%APPDATA%`).
+- Hiciste `pair` con una versión ≤ v0.2.2 y el archivo viejo quedó en
+  `%APPDATA%\NovaSoftPrintAgent\config.json`. El agent lo migra solo,
+  pero solo puede verlo el usuario que hizo el `pair`: corre
+  `.\novasoft-agent.exe service install` (o cualquier comando) con **ese
+  usuario** y se copiará a la ruta nueva.
+
+### El servicio está instalado pero no imprime
+
+Por orden:
+
+1. `.\novasoft-agent.exe service status` — ¿dice `CORRIENDO`?
+   - Si dice `DETENIDO`, arráncalo: `service start` (como administrador).
+2. Abre `C:\ProgramData\NovaSoftAgent\logs\agent.log` con el Bloc de
+   notas y mira las últimas líneas. Ahí está el motivo real.
+3. Si el log dice que no encuentra impresoras: enciende la impresora y
+   reinicia el servicio (`service stop` y `service start`).
+4. Visor de eventos → Registros de Windows → Aplicación, filtra por
+   origen `NovaSoftPrintAgent`: ahí quedan arranques, paradas y errores
+   fatales.
+
+### El servicio no ve la impresora, pero `run` a mano sí
+
+El servicio corre como `LocalSystem`. Esa cuenta ve las impresoras
+instaladas **para todo el equipo**, pero NO las que un usuario agregó
+solo para su perfil (típico de impresoras de red agregadas desde
+"Agregar impresora" con una sesión iniciada).
+
+Solución: reinstala la impresora como impresora del equipo (con el
+driver del fabricante, conectada por USB, es lo normal), o comparte la
+impresora de red a nivel máquina.
 
 ### "no hay impresoras instaladas en Windows"
 
@@ -246,10 +395,16 @@ pasos 2–5 desde la computadora nueva.
 
 El agent:
 - **NO manda** datos de venta a NovaSoft.
-- Solo mantiene una conexión WebSocket para recibir jobs y reportar si
-  imprimieron correctamente.
-- El token local (`config.json`) tiene permisos `0600` — solo tu usuario
-  de Windows lo lee.
+- Solo mantiene una conexión SSE saliente para recibir jobs y reportar
+  si imprimieron correctamente.
+- El token local vive en `C:\ProgramData\NovaSoftAgent\config.json`, con
+  los permisos que hereda de `C:\ProgramData`: control total para SYSTEM
+  y Administradores, **solo lectura** para el resto de usuarios del
+  equipo. Es un cambio respecto a versiones ≤ v0.2.2, donde el archivo
+  estaba en `%APPDATA%` y solo lo veía un usuario; el precio de que el
+  servicio (LocalSystem) pueda leerlo. En una caja de restaurante, donde
+  todos los usuarios son del negocio, es una compensación aceptable —
+  pero si compartes ese equipo con terceros, tenlo en cuenta.
 - Si pierdes acceso al equipo, desempareja desde NovaSoft (🗑️) — eso
   invalida el token remoto.
 
