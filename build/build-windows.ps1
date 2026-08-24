@@ -8,7 +8,7 @@
 #   dist\windows\novasoft-agent.exe
 
 param(
-    [string]$Version = "0.2.2"
+    [string]$Version = "0.3.0"
 )
 
 $ErrorActionPreference = "Stop"
@@ -68,4 +68,5 @@ Write-Host "Proximos pasos:" -ForegroundColor Cyan
 Write-Host "  1. cd $OutputDir"
 Write-Host "  2. .\novasoft-agent.exe version"
 Write-Host "  3. .\novasoft-agent.exe pair  (usa el codigo del wizard)"
-Write-Host "  4. .\novasoft-agent.exe run"
+Write-Host "  4. .\novasoft-agent.exe service install   (PowerShell como admin)"
+Write-Host "  5. .\novasoft-agent.exe service start"
