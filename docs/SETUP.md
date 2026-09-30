@@ -15,6 +15,35 @@ NovaSoft por primera vez.
 - **Conexión a internet** (el agent habla con api.novasoft.mx / Railway).
 - **Rol ADMIN o MANAGER** en NovaSoft.
 
+## Instalación recomendada — instalador de doble clic (desde v0.4.1)
+
+1. En NovaSoft: **Configuración → Impresoras → Agregar impresora**, ponle
+   nombre y deja a la vista el código (dura 10 minutos).
+2. Descarga y abre `NovaSoftAgentSetup.exe`
+   (`releases/latest/download/NovaSoftAgentSetup.exe`). Windows pide
+   permiso de administrador: acepta. Si SmartScreen avisa, **Más
+   información → Ejecutar de todas formas**.
+3. Acepta la licencia y **escribe el código**. El instalador lo valida en
+   ese momento: si está mal escrito, ya se usó, venció o no hay internet,
+   lo dice y te deja corregirlo.
+4. **Instalar → Finalizar.** Queda en `C:\Program Files\NovaSoft\PrintAgent`
+   como servicio de Windows (arranque automático y reinicio ante fallo).
+   NovaSoft detecta la impresora en segundos y ofrece la prueba.
+
+Reinstalar o actualizar: vuelve a correr el instalador y deja el código
+vacío — conserva el emparejamiento. Instalación silenciosa para soporte:
+
+```powershell
+NovaSoftAgentSetup.exe /VERYSILENT /CODE=ABCD-1234-WXYZ
+```
+
+Desinstalar: *Configuración de Windows → Aplicaciones → NovaSoft Print
+Agent*. Detiene y quita el servicio; el emparejamiento y los logs se
+quedan en `C:\ProgramData\NovaSoftAgent`.
+
+Lo que sigue es la **instalación manual** (sin instalador), útil para
+diagnóstico.
+
 ## 1 — Descarga el Agent
 
 Descarga `novasoft-agent.exe` desde el último release en:

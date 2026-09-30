@@ -15,6 +15,7 @@ package pairing
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -22,6 +23,15 @@ import (
 	"runtime"
 	"strings"
 	"time"
+)
+
+// Errores con nombre para que quien llama (el instalador, vía el código de
+// salida de `pair`) distinga la causa sin parsear texto.
+var (
+	ErrCodeInvalid = errors.New("código inválido — revisa que esté bien copiado")
+	ErrCodeUsed    = errors.New("este código ya fue usado — genera uno nuevo en NovaSoft")
+	ErrCodeExpired = errors.New("el código expiró — genera uno nuevo en NovaSoft")
+	ErrNoNetwork   = errors.New("no pude conectar con el servidor — revisa la conexión a internet")
 )
 
 // httpTimeout aplica al handshake de pair — debe ser suficiente para
@@ -116,7 +126,7 @@ func Pair(backendURL, pairingCode, agentVersion string) (*PairResponse, error) {
 	httpClient := &http.Client{Timeout: httpTimeout}
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("no pude conectar con el servidor: %w", err)
+		return nil, fmt.Errorf("%w (%v)", ErrNoNetwork, err)
 	}
 	defer resp.Body.Close()
 
@@ -133,11 +143,11 @@ func Pair(backendURL, pairingCode, agentVersion string) (*PairResponse, error) {
 		}
 		return &pr, nil
 	case http.StatusNotFound:
-		return nil, fmt.Errorf("código inválido — revisa que esté bien copiado")
+		return nil, ErrCodeInvalid
 	case http.StatusConflict:
-		return nil, fmt.Errorf("este código ya fue usado — genera uno nuevo en NovaSoft")
+		return nil, ErrCodeUsed
 	case http.StatusGone:
-		return nil, fmt.Errorf("el código expiró — genera uno nuevo en NovaSoft")
+		return nil, ErrCodeExpired
 	default:
 		return nil, fmt.Errorf("servidor retornó %d: %s", resp.StatusCode, previewBody(respBody))
 	}
