@@ -1,14 +1,14 @@
 ﻿# NovaSoft Print Agent — build script para Windows amd64.
 #
 # Uso:
-#   .\build\build-windows.ps1                    # version default v0.4.0
+#   .\build\build-windows.ps1                    # version default v0.4.1
 #   .\build\build-windows.ps1 -Version "v0.4.1"  # override
 #
 # Salida:
 #   dist\windows\novasoft-agent.exe
 
 param(
-    [string]$Version = "v0.4.0"
+    [string]$Version = "v0.4.1"
 )
 
 $ErrorActionPreference = "Stop"

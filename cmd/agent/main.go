@@ -57,9 +57,12 @@ import (
 var Version = "v0.4.0-dev"
 
 // DefaultBackendURL se puede sobreescribir con -backend.
-// Apunta al Railway prod — el deploy de producción corre ahí. Si Ricardo
-// deploya a otro proyecto Railway, override con la flag.
-const DefaultBackendURL = "https://novasoft-backend-production.up.railway.app"
+// Dominio público del backend. El backend sólo acepta hosts *.novasoft.mx
+// (TrustedHostMiddleware, desde abr-2026): la URL *.up.railway.app responde
+// 400 "Invalid host header". v0.3.0 ya apuntaba aquí; v0.4.0 regresó a la
+// URL de Railway por error y por eso el instalador v0.4.1 no emparejaba
+// (prueba del 2026-10-07). Se puede sobreescribir con -backend.
+const DefaultBackendURL = "https://api.novasoft.mx"
 
 func main() {
 	// Flags globales. Se parsean antes del subcomando para que funcione
@@ -76,7 +79,10 @@ func main() {
 	cmd := args[0]
 	switch cmd {
 	case "pair":
-		fail(cmdPair(*backendFlag))
+		if err := cmdPair(*backendFlag, args[1:]); err != nil {
+			fmt.Fprintf(os.Stderr, "✗ %s\n", err)
+			os.Exit(pairExitCode(err))
+		}
 	case "run":
 		fail(cmdRun())
 	case "service":
@@ -111,8 +117,9 @@ Uso:
   novasoft-agent.exe [-backend=URL] <comando>
 
 Comandos:
-  pair       Empareja con un restaurante usando un código del wizard.
-  run        Arranca el loop principal en esta consola — escucha jobs.
+  pair       Empareja con un restaurante usando un código del wizard
+             (pair ABCD-1234-WXYZ, o sin código para teclearlo).
+  run       Arranca el loop principal en esta consola — escucha jobs.
   service    Administra el servicio de Windows (ver abajo).
   status     Muestra la config actual y las impresoras detectadas.
   unpair     Borra la config local.
@@ -135,17 +142,25 @@ Ejemplos:
 `)
 }
 
-// cmdPair pide el código por stdin, llama al backend, guarda config.
-func cmdPair(backendURL string) error {
+// cmdPair empareja con el código del wizard, llama al backend y guarda
+// config. El código llega como argumento (`pair ABCD-1234-WXYZ`, lo usa el
+// instalador para validarlo sin consola) o, si no viene, se pide por stdin.
+func cmdPair(backendURL string, args []string) error {
 	fmt.Println("=== NovaSoft Print Agent — Emparejamiento ===")
-	fmt.Print("Ingresa el código que aparece en NovaSoft: ")
 
-	reader := bufio.NewReader(os.Stdin)
-	raw, err := reader.ReadString('\n')
-	if err != nil {
-		return fmt.Errorf("leyendo código: %w", err)
+	var raw string
+	if len(args) > 0 {
+		raw = args[0]
+	} else {
+		fmt.Print("Ingresa el código que aparece en NovaSoft: ")
+		reader := bufio.NewReader(os.Stdin)
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return fmt.Errorf("leyendo código: %w", err)
+		}
+		raw = line
 	}
-	raw = strings.TrimSpace(raw)
+	raw = strings.TrimSpace(raw) // pairing.NormalizeCode hace el resto
 	if raw == "" {
 		return fmt.Errorf("no ingresaste ningún código")
 	}
@@ -181,6 +196,32 @@ el emparejamiento`, err)
 	fmt.Println("  novasoft-agent.exe service install")
 	fmt.Println("  novasoft-agent.exe service start")
 	return nil
+}
+
+// Códigos de salida de `pair`. Son contrato con el instalador
+// (build/installer/novasoft-agent-setup.iss): con ellos muestra el mensaje
+// exacto sin leer la consola. No renumerar sin cambiar el instalador.
+const (
+	exitPairOtro     = 1 // cualquier otra falla (config, servidor 5xx…)
+	exitPairInvalido = 2
+	exitPairUsado    = 3
+	exitPairVencido  = 4
+	exitPairSinRed   = 5
+)
+
+func pairExitCode(err error) int {
+	switch {
+	case errors.Is(err, pairing.ErrCodeInvalid):
+		return exitPairInvalido
+	case errors.Is(err, pairing.ErrCodeUsed):
+		return exitPairUsado
+	case errors.Is(err, pairing.ErrCodeExpired):
+		return exitPairVencido
+	case errors.Is(err, pairing.ErrNoNetwork):
+		return exitPairSinRed
+	default:
+		return exitPairOtro
+	}
 }
 
 // cmdRun decide entre modo servicio y modo consola.
