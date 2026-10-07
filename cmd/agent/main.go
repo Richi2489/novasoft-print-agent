@@ -57,9 +57,12 @@ import (
 var Version = "v0.4.0-dev"
 
 // DefaultBackendURL se puede sobreescribir con -backend.
-// Apunta al Railway prod — el deploy de producción corre ahí. Si Ricardo
-// deploya a otro proyecto Railway, override con la flag.
-const DefaultBackendURL = "https://novasoft-backend-production.up.railway.app"
+// Dominio público del backend. El backend sólo acepta hosts *.novasoft.mx
+// (TrustedHostMiddleware, desde abr-2026): la URL *.up.railway.app responde
+// 400 "Invalid host header". v0.3.0 ya apuntaba aquí; v0.4.0 regresó a la
+// URL de Railway por error y por eso el instalador v0.4.1 no emparejaba
+// (prueba del 2026-10-07). Se puede sobreescribir con -backend.
+const DefaultBackendURL = "https://api.novasoft.mx"
 
 func main() {
 	// Flags globales. Se parsean antes del subcomando para que funcione
