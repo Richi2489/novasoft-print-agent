@@ -1,7 +1,7 @@
 ﻿# NovaSoft Print Agent — compila el agente y el instalador de doble clic.
 #
 # Uso:
-#   .\build\build-installer.ps1 -Version v0.4.1
+#   .\build\build-installer.ps1 -Version v0.5.0
 #
 # Salida:
 #   dist\windows\novasoft-agent.exe

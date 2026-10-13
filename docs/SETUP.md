@@ -31,7 +31,12 @@ NovaSoft por primera vez.
    NovaSoft detecta la impresora en segundos y ofrece la prueba.
 
 Reinstalar o actualizar: vuelve a correr el instalador y deja el código
-vacío — conserva el emparejamiento. Instalación silenciosa para soporte:
+vacío — conserva el emparejamiento. Desde v0.5.0 esto vale también al
+actualizar desde v0.3.0 (config en `C:\ProgramData\NovaSoft\`): **no
+escribas un código nuevo**, porque crearía otra impresora en NovaSoft y las
+cajas que tenían elegida la vieja dejarían de imprimir. Actualización
+silenciosa sin código: `NovaSoftAgentSetup.exe /VERYSILENT`.
+Instalación silenciosa para soporte:
 
 ```powershell
 NovaSoftAgentSetup.exe /VERYSILENT /CODE=ABCD-1234-WXYZ

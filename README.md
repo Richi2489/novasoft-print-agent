@@ -74,6 +74,7 @@ apuntando a un modo y probar a mano el otro.
 | Ruta | Qué hay |
 |---|---|
 | `C:\ProgramData\NovaSoftAgent\config.json` | Emparejamiento (token) |
+| `C:\ProgramData\NovaSoftAgent\journal.json` | Diario de tickets (7 días) — evita imprimir dos veces (v0.5.0+) |
 | `C:\ProgramData\NovaSoftAgent\logs\agent.log` | Log, rotado a 5 MB × 4 |
 | Visor de eventos → Aplicación → `NovaSoftPrintAgent` | Arranque, parada, errores fatales |
 
@@ -81,7 +82,33 @@ La config vive en `%PROGRAMDATA%` (máquina) y no en `%APPDATA%`
 (usuario) porque el servicio corre como `LocalSystem`, que tiene otro
 `%APPDATA%` y nunca encontraría el config del usuario que hizo `pair`.
 Los agents emparejados con versiones anteriores se migran solos — ver
-`internal/config` y `docs/SETUP.md`.
+`internal/config` y `docs/SETUP.md`. Desde v0.5.0 eso incluye el config de
+v0.3.0 (`C:\ProgramData\NovaSoft\config.json`): actualizar con el
+instalador **no** pide un código nuevo.
+
+## Protocolo de impresión v2 (v0.5.0+)
+
+Contrato completo en el backend: `docs/printing/protocolo-v2.md`.
+
+- **Diario local** (`internal/journal`): cada entrega tiene una
+  `delivery_key` (`<job_id>:<reintento>`). Se marca `printing` en disco
+  ANTES de imprimir y `printed`/`failed` al terminar. Una clave repetida
+  **nunca se reimprime**: se reporta el resultado guardado. Una que quedó a
+  medias porque el agente se reinició tampoco se reimprime: se reporta
+  `failed` pidiendo revisar si salió.
+- **Saludo**: antes de cada conexión, `POST /printing/agents/hello` con la
+  versión y los resultados de los últimos 7 días (máx. 200). Así el backend
+  cierra los tickets cuyo reporte se perdió y **reentrega** (en vez de
+  marcar "falló") lo que nunca llegó.
+- **Reportes con reintento**: si el POST del resultado falla, queda
+  pendiente en el diario y se reintenta cada 60 s y en el siguiente saludo.
+- **Heartbeat**: si en 45 s no llega ni un byte (el servidor manda
+  keepalive cada 15 s), la conexión se da por muerta y se reconecta. Se
+  pausa mientras se imprime.
+- **Reconexión**: backoff exponencial 1 s → 30 s con jitter; vuelve a 1 s
+  tras una conexión que duró ≥ 30 s.
+- Contra un backend viejo (v1) todo sigue funcionando: el saludo devuelve
+  404 y se ignora, y sin `delivery_key` la clave es el `job_id`.
 
 ## Desarrollo
 
@@ -106,7 +133,8 @@ novasoft-print-agent/
 │   ├── winsvc/             # servicio de Windows: SCM, recovery, Event Log
 │   │                       # (*_windows.go con build tag)
 │   ├── pairing/            # handshake HTTP para obtener token
-│   ├── sse/                # cliente SSE (net/http stdlib) + POST result
+│   ├── sse/                # cliente SSE (net/http stdlib) + saludo + POST result
+│   ├── journal/            # diario local de entregas (anti-duplicado, v2)
 │   └── printer/            # discovery + send raw + ESC/POS converter
 │                           # (discover/print *_windows.go con build tag)
 ├── pkg/escpos/             # constantes ESC/POS (reutilizable)
@@ -118,7 +146,6 @@ novasoft-print-agent/
 
 | Package | Propósito |
 |---|---|
-| `github.com/cenkalti/backoff/v4` | Backoff exponencial para reconexión |
 | `github.com/alexbrainman/printer` | winspool wrapper (puro syscall, sin CGO) |
 | `golang.org/x/sys/windows/svc` | Servicio de Windows: SCM, `mgr`, Event Log |
 

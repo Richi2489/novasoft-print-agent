@@ -26,10 +26,17 @@
 //
 //	%PROGRAMDATA%\NovaSoftAgent\config.json
 //
-// que SYSTEM y el usuario ven igual. La ruta vieja
-// (%APPDATA%\NovaSoftPrintAgent\config.json) se migra automáticamente
-// la primera vez que se lee — ver MigrateLegacy. Un agent ya emparejado
-// NO tiene que volver a emparejarse al actualizar.
+// que SYSTEM y el usuario ven igual. Las rutas viejas se migran
+// automáticamente la primera vez que se lee — ver MigrateLegacy. Un agent
+// ya emparejado NO tiene que volver a emparejarse al actualizar:
+//
+//	%PROGRAMDATA%\NovaSoft\config.json          (v0.3.0, servicio + bandeja)
+//	%APPDATA%\NovaSoftPrintAgent\config.json    (v0.2.x)
+//
+// La de v0.3.0 importa: es la que tiene La Capital. Sin migrarla, el
+// instalador v0.4.x encontraba "no emparejado" y pedía un código nuevo,
+// que crea OTRA impresora en el backend (las cajas que la tenían elegida
+// quedaban apuntando a la vieja).
 //
 // En macOS/Linux no hay servicio de Windows, así que se conservan las
 // rutas por usuario de siempre.
@@ -43,6 +50,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 )
 
 // Config es el estado persistente del agent emparejado.
@@ -134,7 +142,7 @@ func Path() (string, error) {
 	return filepath.Join(dir, "config.json"), nil
 }
 
-// LegacyPath devuelve la ruta donde vivía el config antes de v0.3.0
+// LegacyPath devuelve la ruta donde vivía el config en v0.2.x
 // (%APPDATA%\NovaSoftPrintAgent\config.json en Windows). Devuelve ""
 // en plataformas donde la ruta nunca cambió.
 func LegacyPath() string {
@@ -147,6 +155,37 @@ func LegacyPath() string {
 	}
 	return filepath.Join(appdata, "NovaSoftPrintAgent", "config.json")
 }
+
+// LegacyV030Path es donde v0.3.0 (servicio + icono de bandeja) guardaba el
+// config: %PROGRAMDATA%\NovaSoft\config.json. Al ser de máquina, también lo
+// ve el servicio corriendo como LocalSystem.
+func LegacyV030Path() string {
+	if runtime.GOOS != "windows" {
+		return ""
+	}
+	programData := os.Getenv("PROGRAMDATA")
+	if programData == "" {
+		return ""
+	}
+	return filepath.Join(programData, "NovaSoft", "config.json")
+}
+
+// LegacyPaths son las rutas viejas en orden de preferencia (la más nueva
+// primero).
+func LegacyPaths() []string {
+	var out []string
+	for _, p := range []string{LegacyV030Path(), LegacyPath()} {
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// legacyRailwayBackendURL — URL directa a Railway que algunos configs
+// viejos guardaron; el backend la rechaza (TrustedHostMiddleware).
+const legacyRailwayBackendURL = "https://novasoft-backend-production.up.railway.app"
+const currentBackendURL = "https://api.novasoft.mx"
 
 // MigrateLegacy copia el config de la ruta vieja (%APPDATA%) a la nueva
 // (%PROGRAMDATA%) si —y solo si— la nueva todavía no existe y la vieja
@@ -163,16 +202,9 @@ func LegacyPath() string {
 // hizo el `pair` (LocalSystem tiene otro %APPDATA%). Por eso
 // `service install` la invoca explícitamente antes de crear el servicio.
 func MigrateLegacy() (bool, error) {
-	legacy := LegacyPath()
-	if legacy == "" {
-		return false, nil
-	}
 	newPath, err := Path()
 	if err != nil {
 		return false, err
-	}
-	if newPath == legacy {
-		return false, nil
 	}
 
 	// ¿Ya hay config en la ruta nueva? Entonces manda esa — no pisamos.
@@ -182,10 +214,28 @@ func MigrateLegacy() (bool, error) {
 		return false, fmt.Errorf("revisando %s: %w", newPath, err)
 	}
 
+	var primerError error
+	for _, legacy := range LegacyPaths() {
+		if legacy == newPath {
+			continue
+		}
+		migrated, err := migrateFrom(legacy)
+		if migrated {
+			return true, nil
+		}
+		if err != nil && primerError == nil {
+			primerError = err
+		}
+	}
+	return false, primerError
+}
+
+// migrateFrom copia un config viejo válido a la ruta nueva.
+func migrateFrom(legacy string) (bool, error) {
 	data, err := os.ReadFile(legacy)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return false, nil // nada que migrar — instalación limpia
+			return false, nil // nada que migrar en esta ruta
 		}
 		return false, fmt.Errorf("leyendo config viejo %s: %w", legacy, err)
 	}
@@ -198,8 +248,17 @@ func MigrateLegacy() (bool, error) {
 	if cfg.AgentToken == "" {
 		return false, nil // incompleto — que el usuario haga pair de nuevo
 	}
+	if cfg.BackendURL == "" || cfg.BackendURL == legacyRailwayBackendURL {
+		cfg.BackendURL = currentBackendURL
+	}
+	if cfg.WebsocketURL == "" {
+		// Load() exige el campo (señal de escritura completa); el agent no
+		// lo usa desde el pivot a SSE.
+		cfg.WebsocketURL = strings.TrimRight(cfg.BackendURL, "/") + "/printing/agents/stream"
+	}
 
 	if err := Save(cfg); err != nil {
+		newPath, _ := Path()
 		return false, fmt.Errorf("migrando config a %s: %w", newPath, err)
 	}
 	return true, nil
@@ -223,7 +282,8 @@ func Load() (*Config, error) {
 		if !os.IsNotExist(err) {
 			return nil, fmt.Errorf("leyendo config: %w", err)
 		}
-		// Puede ser un agent emparejado con una versión < v0.3.0.
+		// Puede ser un agent emparejado con una versión anterior (v0.3.0
+		// en %PROGRAMDATA%\NovaSoft, o v0.2.x en %APPDATA%).
 		// Best-effort: si la migración falla seguimos reportando
 		// ErrNotConfigured, que es el mensaje accionable.
 		migrated, mErr := MigrateLegacy()
@@ -304,8 +364,8 @@ func Save(cfg *Config) error {
 }
 
 // Delete borra el archivo de config. Idempotente — no falla si ya no existe.
-// También limpia el archivo de la ruta vieja para que un `unpair` no deje
-// un config zombie que una futura migración vuelva a resucitar.
+// También limpia los archivos de las rutas viejas para que un `unpair` no
+// deje un config zombie que una futura migración vuelva a resucitar.
 func Delete() error {
 	path, err := Path()
 	if err != nil {
@@ -314,7 +374,10 @@ func Delete() error {
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	if legacy := LegacyPath(); legacy != "" && legacy != path {
+	for _, legacy := range LegacyPaths() {
+		if legacy == path {
+			continue
+		}
 		if err := os.Remove(legacy); err != nil && !os.IsNotExist(err) {
 			return err
 		}
