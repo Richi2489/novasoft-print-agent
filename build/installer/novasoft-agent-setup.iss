@@ -13,10 +13,18 @@
 ; Instalación silenciosa para soporte:
 ;   NovaSoftAgentSetup.exe /VERYSILENT /CODE=ABCD-1234-WXYZ
 ;
-; Compilar: .\build\build-installer.ps1 -Version v0.4.1
+; Compilar: .\build\build-installer.ps1 -Version v0.5.0
+;
+; Actualizar desde v0.3.0 / v0.4.x: se corre este mismo instalador encima.
+; Mismo AppId → reemplaza la versión anterior sin desinstalar, y el
+; emparejamiento se conserva: v0.4.x ya lo tenía en
+; C:\ProgramData\NovaSoftAgent\config.json y el de v0.3.0
+; (C:\ProgramData\NovaSoft\config.json) lo migra `service install` (v0.5.0+).
+; Con el campo del código VACÍO no se crea una impresora nueva en NovaSoft.
 ;
 ; Datos que NO se borran al desinstalar (sobreviven a reinstalaciones):
 ;   C:\ProgramData\NovaSoftAgent\config.json   (emparejamiento)
+;   C:\ProgramData\NovaSoftAgent\journal.json  (diario de tickets, 7 días — evita duplicados)
 ;   C:\ProgramData\NovaSoftAgent\logs\agent.log
 
 #ifndef MyAppVersion
@@ -110,9 +118,18 @@ begin
   Result := ExpandConstant('{commonappdata}\NovaSoftAgent\config.json');
 end;
 
+// Donde v0.3.0 (servicio + icono de bandeja) guardaba el emparejamiento. El
+// agente >= 0.5.0 lo migra solo en `service install`; aquí solo importa
+// para no exigir un código nuevo a quien actualiza (un código nuevo crea
+// OTRA impresora en NovaSoft y las cajas quedan apuntando a la vieja).
+function RutaConfigV030: String;
+begin
+  Result := ExpandConstant('{commonappdata}\NovaSoft\config.json');
+end;
+
 function YaEstabaEmparejado: Boolean;
 begin
-  Result := FileExists(RutaConfig);
+  Result := FileExists(RutaConfig) or FileExists(RutaConfigV030);
 end;
 
 // Contrato con cmd/agent/main.go (exitPair*). No renumerar por separado.

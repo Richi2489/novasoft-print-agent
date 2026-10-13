@@ -5,14 +5,16 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net/http"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
-
-	"github.com/cenkalti/backoff/v4"
 )
 
 // Defaults de red. Ajustar con cuidado — cambian la vivacidad del
@@ -22,39 +24,65 @@ const (
 	// 10 s es generoso para redes lentas pero no eterno.
 	handshakeTimeout = 10 * time.Second
 
-	// ResultTimeout — timeout del POST de reporte de resultado. Debe
-	// ser corto — si el servidor no responde rápido algo está mal.
+	// ResultTimeout — timeout del POST de reporte de resultado y del
+	// saludo. Debe ser corto — si el servidor no responde rápido algo está
+	// mal.
 	resultTimeout = 10 * time.Second
 
-	// reconnectInitial / reconnectMax — bounds del backoff.
-	reconnectInitial = 2 * time.Second
+	// Backoff de reconexión: exponencial desde 1 s, tope 30 s, con jitter.
+	reconnectInitial = 1 * time.Second
 	reconnectMax     = 30 * time.Second
+
+	// Una conexión que duró al menos esto se considera sana: el siguiente
+	// corte vuelve a empezar el backoff desde reconnectInitial.
+	conexionSana = 30 * time.Second
+
+	// DefaultIdleTimeout — heartbeat. El backend manda `: keepalive` cada
+	// 15 s; si en 45 s no llega NI UN BYTE, la conexión está muerta aunque
+	// el socket siga "abierto" (NAT que la tiró, Wi-Fi que se cayó y
+	// volvió). Sin esto el agente esperaba para siempre en el read y el
+	// backend seguía creyendo que estaba conectado.
+	DefaultIdleTimeout = 45 * time.Second
 )
+
+// ErrSinSenal es el error de una conexión que dejó de recibir bytes.
+var ErrSinSenal = errors.New("sin señal del servidor")
 
 // Client es un cliente SSE del endpoint /printing/agents/stream del
 // backend + un POST-er para reportar resultados. Maneja:
 //   - Auth vía Authorization: Bearer header.
+//   - Protocolo v2: saludo antes de cada conexión (BeforeConnect) y
+//     cabeceras X-NovaSoft-Print-Protocol / X-NovaSoft-Agent-Version.
 //   - Parseo de eventos SSE (`event:`, `data:`, blank line = end of event).
-//   - Reconexión automática con backoff exponencial (2s → 30s, infinito).
+//   - Heartbeat: corta la conexión si no llega nada en IdleTimeout.
+//   - Reconexión automática con backoff exponencial con jitter (tope 30 s).
 //
 // NO es thread-safe para múltiples calls concurrentes a RunWithReconnect.
-// Las calls a ReportJobResult desde distintas goroutines sí son seguras
-// porque usan http.Client que es thread-safe.
+// ReportJobResult y Hello sí se pueden llamar desde otras goroutines.
 type Client struct {
 	// BackendURL es la raíz del backend, ej. "https://api.novasoft.mx".
-	// Derivamos StreamURL y ResultURL de aquí.
 	BackendURL string
 	Token      string
 
-	// OnPrintJob se invoca por cada evento print_job recibido. Puede
-	// ser nil — en ese caso los eventos se loguean y se ignoran (útil
-	// para tests).
+	// AgentVersion se reporta al backend ("0.5.0", sin "v").
+	AgentVersion string
+
+	// OnPrintJob se invoca por cada evento print_job recibido, en la
+	// misma goroutine que lee el stream (un job a la vez). Puede ser nil.
 	OnPrintJob func(*PrintJob)
 
-	// http es reusable entre reconexiones. Sin timeout en el client
-	// mismo — los timeouts van en contexto o en request individual,
-	// porque el stream GET debe quedarse abierto indefinidamente.
+	// BeforeConnect se invoca antes de abrir cada conexión (aquí va el
+	// saludo v2). Un error se loguea pero NO impide conectar: la
+	// reentrega del backend es segura igual gracias al diario.
+	BeforeConnect func(ctx context.Context) error
+
+	// IdleTimeout — heartbeat. 0 = DefaultIdleTimeout.
+	IdleTimeout time.Duration
+
 	http *http.Client
+
+	rndMu sync.Mutex
+	rnd   *rand.Rand
 }
 
 // New construye un Client. BackendURL puede tener trailing slash o no;
@@ -63,24 +91,13 @@ type Client struct {
 // Importante sobre timeouts:
 //   - http.Client.Timeout = 0 (sin timeout global). Ese timeout aplica a
 //     TODO el request incluyendo body read — para un stream long-lived
-//     SSE eso cortaría el read al cumplirse y veríamos
-//     "context canceled" a cada rato.
-//   - ResponseHeaderTimeout en el Transport sí limita solo los headers
-//     (hasta que servidor responda con status + headers). Después de
-//     eso, el body lee indefinidamente hasta que el caller cierre
-//     o el context parent se cancele.
-//   - NO usamos context.WithTimeout atado al request para la apertura:
-//     ese patrón ataba el openCtx al body del response, y el cancel()
-//     posterior mataba el read con context canceled. Bug de v0.2.0.
+//     SSE eso cortaría el read al cumplirse.
+//   - ResponseHeaderTimeout en el Transport sí limita solo los headers.
+//   - El heartbeat (IdleTimeout) cancela el contexto de la conexión cuando
+//     no llegan bytes — no hay deadline fijo sobre un stream sano.
 func New(backendURL, token string) *Client {
 	transport := &http.Transport{
-		// Timeout solo para recibir los headers iniciales. Si el
-		// servidor tarda más, fallamos el handshake y backoff reintenta.
-		// El body que sigue no tiene deadline — es un stream long-lived.
 		ResponseHeaderTimeout: handshakeTimeout,
-		// ForceAttemptHTTP2 default = true; SSE funciona tanto con
-		// HTTP/1.1 chunked como con HTTP/2 streaming. Dejamos que
-		// negocie.
 	}
 	return &Client{
 		BackendURL: strings.TrimRight(backendURL, "/"),
@@ -89,71 +106,114 @@ func New(backendURL, token string) *Client {
 			Timeout:   0, // EXPLÍCITO — los stream son long-lived.
 			Transport: transport,
 		},
+		rnd: rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
 }
 
-// RunWithReconnect bloquea hasta ctx.Done(). Cada desconexión dispara
-// backoff antes de reintentar. MaxElapsedTime=0 = infinito.
-func (c *Client) RunWithReconnect(ctx context.Context) {
-	b := backoff.NewExponentialBackOff()
-	b.InitialInterval = reconnectInitial
-	b.MaxInterval = reconnectMax
-	b.MaxElapsedTime = 0
-	b.Reset()
+func (c *Client) userAgent() string {
+	if c.AgentVersion == "" {
+		return "novasoft-print-agent"
+	}
+	return "novasoft-print-agent/" + c.AgentVersion
+}
 
+func (c *Client) idle() time.Duration {
+	if c.IdleTimeout > 0 {
+		return c.IdleTimeout
+	}
+	return DefaultIdleTimeout
+}
+
+// Backoff calcula la espera antes del reintento número `intento` (0 = el
+// primero): exponencial desde 1 s con tope 30 s y "equal jitter" (entre la
+// mitad y el total), para que varias cajas de un mismo local no golpeen
+// al servidor todas en el mismo segundo tras un corte.
+func Backoff(intento int, aleatorio float64) time.Duration {
+	if intento < 0 {
+		intento = 0
+	}
+	d := reconnectInitial
+	for i := 0; i < intento && d < reconnectMax; i++ {
+		d *= 2
+	}
+	if d > reconnectMax {
+		d = reconnectMax
+	}
+	if aleatorio < 0 {
+		aleatorio = 0
+	}
+	if aleatorio > 1 {
+		aleatorio = 1
+	}
+	mitad := d / 2
+	return mitad + time.Duration(aleatorio*float64(d-mitad))
+}
+
+func (c *Client) aleatorio() float64 {
+	c.rndMu.Lock()
+	defer c.rndMu.Unlock()
+	if c.rnd == nil {
+		c.rnd = rand.New(rand.NewSource(time.Now().UnixNano()))
+	}
+	return c.rnd.Float64()
+}
+
+// RunWithReconnect bloquea hasta ctx.Done(). Cada desconexión espera un
+// backoff antes de reintentar; nunca se rinde.
+func (c *Client) RunWithReconnect(ctx context.Context) {
+	intento := 0
 	for {
+		if ctx.Err() != nil {
+			return
+		}
+
+		if c.BeforeConnect != nil {
+			if err := c.BeforeConnect(ctx); err != nil && ctx.Err() == nil {
+				log.Printf("⚠️  saludo al servidor falló (%v); se conecta igual", err)
+			}
+		}
+
+		inicio := time.Now()
+		err := c.connectAndServe(ctx)
+		if ctx.Err() != nil {
+			return
+		}
+		if time.Since(inicio) >= conexionSana {
+			intento = 0
+		}
+		wait := Backoff(intento, c.aleatorio())
+		intento++
+		log.Printf("⚠️  desconectado (%v); reintento en %v", err, wait.Round(100*time.Millisecond))
 		select {
+		case <-time.After(wait):
 		case <-ctx.Done():
 			return
-		default:
 		}
-
-		err := c.connectAndServe(ctx)
-		if err != nil {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
-			wait := b.NextBackOff()
-			log.Printf("⚠️  desconectado (%v); reintento en %v", err, wait)
-			select {
-			case <-time.After(wait):
-			case <-ctx.Done():
-				return
-			}
-			continue
-		}
-		// connectAndServe retornó sin error → ctx cancelado por shutdown.
-		return
 	}
 }
 
-// connectAndServe abre el stream GET, parsea eventos hasta EOF/error.
-//
-// El request se construye con el `ctx` del caller (RunWithReconnect) —
-// mismo ctx durante TODO el ciclo de vida de la conexión. El handshake
-// timeout NO se impone acá con context.WithTimeout (ese patrón, usado
-// en v0.2.0, cancelaba el ctx tras el handshake y mataba el body read
-// con "context canceled"); en su lugar el Transport.ResponseHeaderTimeout
-// configurado en New() limita solo la fase de headers.
+// connectAndServe abre el stream GET y parsea eventos hasta EOF/error.
 func (c *Client) connectAndServe(ctx context.Context) error {
 	url := c.BackendURL + "/printing/agents/stream"
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	connCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(connCtx, http.MethodGet, url, nil)
 	if err != nil {
 		return fmt.Errorf("build request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+c.Token)
 	req.Header.Set("Accept", "text/event-stream")
 	req.Header.Set("Cache-Control", "no-cache")
-	req.Header.Set("User-Agent", "novasoft-print-agent")
+	req.Header.Set("User-Agent", c.userAgent())
+	req.Header.Set("X-NovaSoft-Print-Protocol", strconv.Itoa(ProtocolVersion))
+	if c.AgentVersion != "" {
+		req.Header.Set("X-NovaSoft-Agent-Version", c.AgentVersion)
+	}
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		// ResponseHeaderTimeout se manifiesta como net.Error con
-		// Timeout()=true. Lo devolvemos tal cual — el caller aplica
-		// backoff y reintenta.
 		return fmt.Errorf("dial SSE: %w", err)
 	}
 	defer resp.Body.Close()
@@ -169,8 +229,72 @@ func (c *Client) connectAndServe(ctx context.Context) error {
 
 	log.Println("✓ Conectado al servidor NovaSoft")
 
-	return c.readLoop(ctx, resp.Body)
+	// Heartbeat: si no llega ningún byte en idle, se cancela la conexión.
+	vigia := newVigia(c.idle(), cancel)
+	defer vigia.detener()
+
+	err = c.readLoop(ctx, resp.Body, vigia)
+	if vigia.disparado() {
+		return fmt.Errorf("%w en %v", ErrSinSenal, c.idle())
+	}
+	return err
 }
+
+// vigia cancela la conexión si pasa `idle` sin actividad. Se pausa
+// mientras se imprime un job (el stream no se lee durante la impresión).
+type vigia struct {
+	idle   time.Duration
+	timer  *time.Timer
+	mu     sync.Mutex
+	fuego  bool
+	pausa  bool
+	cancel context.CancelFunc
+}
+
+func newVigia(idle time.Duration, cancel context.CancelFunc) *vigia {
+	v := &vigia{idle: idle, cancel: cancel}
+	v.timer = time.AfterFunc(idle, func() {
+		v.mu.Lock()
+		if v.pausa {
+			v.mu.Unlock()
+			return
+		}
+		v.fuego = true
+		v.mu.Unlock()
+		cancel()
+	})
+	return v
+}
+
+func (v *vigia) latido() {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if !v.fuego {
+		v.timer.Reset(v.idle)
+	}
+}
+
+func (v *vigia) pausar() {
+	v.mu.Lock()
+	v.pausa = true
+	v.mu.Unlock()
+	v.timer.Stop()
+}
+
+func (v *vigia) reanudar() {
+	v.mu.Lock()
+	v.pausa = false
+	v.mu.Unlock()
+	v.latido()
+}
+
+func (v *vigia) disparado() bool {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.fuego
+}
+
+func (v *vigia) detener() { v.timer.Stop() }
 
 // readLoop parsea eventos SSE. Formato:
 //
@@ -178,12 +302,9 @@ func (c *Client) connectAndServe(ctx context.Context) error {
 //	data: <payload>\n
 //	\n          ← blank line termina el evento
 //
-// Líneas que empiezan con ":" son comentarios (keepalive) y se ignoran.
-// Líneas sin ":" o con campo desconocido se ignoran tolerantemente.
-func (c *Client) readLoop(ctx context.Context, body io.Reader) error {
-	// bufio.Scanner con buffer grande — los payloads pueden ser decenas
-	// de KB si un ticket tiene muchos items. Default 64 KB de Scanner
-	// es OK pero subimos a 1 MB por seguridad.
+// Líneas que empiezan con ":" son comentarios (keepalive) y se ignoran,
+// pero cuentan como latido para el heartbeat.
+func (c *Client) readLoop(ctx context.Context, body io.Reader, v *vigia) error {
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 
@@ -201,7 +322,6 @@ func (c *Client) readLoop(ctx context.Context, body io.Reader) error {
 			return
 		}
 		if currentEvent == "" || currentEvent == "message" {
-			// Evento sin name / tipo default — no nos interesa.
 			return
 		}
 		if currentEvent != "print_job" {
@@ -216,30 +336,30 @@ func (c *Client) readLoop(ctx context.Context, body io.Reader) error {
 			log.Printf("✗ payload SSE inválido: %v", err)
 			return
 		}
+		if v != nil {
+			v.pausar()
+			defer v.reanudar()
+		}
 		c.OnPrintJob(&job)
 	}
 
 	for scanner.Scan() {
-		select {
-		case <-ctx.Done():
+		if v != nil {
+			v.latido()
+		}
+		if ctx.Err() != nil {
 			return nil
-		default:
 		}
 		line := scanner.Text()
 
-		// Línea vacía → fin del evento actual.
 		if line == "" {
 			dispatch()
 			continue
 		}
-
-		// Comentario — se usa para keepalive. Lo ignoramos.
 		if strings.HasPrefix(line, ":") {
 			continue
 		}
 
-		// Formato: "field: value" (el espacio después de ':' es opcional
-		// per spec, lo trimmeamos).
 		colonIdx := strings.IndexByte(line, ':')
 		if colonIdx < 0 {
 			continue
@@ -251,41 +371,77 @@ func (c *Client) readLoop(ctx context.Context, body io.Reader) error {
 		case "event":
 			currentEvent = value
 		case "data":
-			// Pueden venir múltiples líneas `data:` concatenadas con \n.
 			if dataBuf.Len() > 0 {
 				dataBuf.WriteByte('\n')
 			}
 			dataBuf.WriteString(value)
-		case "id", "retry":
-			// Ignorados — no los usamos.
-		default:
-			// Campo desconocido — tolerante, no error.
 		}
 	}
 
 	if err := scanner.Err(); err != nil {
 		return fmt.Errorf("read stream: %w", err)
 	}
-	// EOF limpio (servidor cerró). Reportamos como error para que
-	// RunWithReconnect reintente.
 	return fmt.Errorf("stream cerrado por servidor (EOF)")
 }
 
-// ReportJobResult POST al endpoint del backend con el resultado del job.
-// status debe ser "printed" o "failed"; errMsg es opcional.
-// Thread-safe — http.Client maneja concurrencia.
-func (c *Client) ReportJobResult(ctx context.Context, jobID, status, errMsg string) error {
-	url := fmt.Sprintf("%s/printing/agents/jobs/%s/result", c.BackendURL, jobID)
+// Hello manda el saludo v2. Un backend v1 responde 404/405: se devuelve
+// error y el agente sigue funcionando (la reentrega simplemente no existe
+// del otro lado).
+func (c *Client) Hello(ctx context.Context, results []RecentResult) (*HelloResponse, error) {
+	if results == nil {
+		results = []RecentResult{}
+	}
+	body := HelloRequest{
+		ProtocolVersion: ProtocolVersion,
+		AgentVersion:    c.AgentVersion,
+		RecentResults:   results,
+	}
+	var out HelloResponse
+	if err := c.postJSON(ctx, c.BackendURL+"/printing/agents/hello", body, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
 
+// ReportJobResult POST al endpoint del backend con el resultado del job.
+// status debe ser "printed" o "failed"; errMsg y deliveryKey son
+// opcionales. Devuelve applied=false si el backend ignoró el reporte por
+// venir de un intento viejo (no hay que reintentarlo).
+func (c *Client) ReportJobResult(ctx context.Context, jobID, status, errMsg, deliveryKey string) (bool, error) {
+	url := fmt.Sprintf("%s/printing/agents/jobs/%s/result", c.BackendURL, jobID)
 	body := map[string]string{
 		"status":        status,
 		"error_message": errMsg,
 	}
-	bodyJSON, err := json.Marshal(body)
+	if deliveryKey != "" && deliveryKey != jobID {
+		body["delivery_key"] = deliveryKey
+	}
+	var out struct {
+		OK      bool  `json:"ok"`
+		Applied *bool `json:"applied"`
+	}
+	if err := c.postJSON(ctx, url, body, &out); err != nil {
+		return false, err
+	}
+	if out.Applied != nil {
+		return *out.Applied, nil
+	}
+	return true, nil
+}
+
+// ErrHTTP es un rechazo del servidor con su código.
+type ErrHTTP struct {
+	Status int
+	Body   string
+}
+
+func (e *ErrHTTP) Error() string { return fmt.Sprintf("HTTP %d: %s", e.Status, e.Body) }
+
+func (c *Client) postJSON(ctx context.Context, url string, in, out any) error {
+	bodyJSON, err := json.Marshal(in)
 	if err != nil {
 		return fmt.Errorf("marshal body: %w", err)
 	}
-
 	postCtx, cancel := context.WithTimeout(ctx, resultTimeout)
 	defer cancel()
 
@@ -295,17 +451,21 @@ func (c *Client) ReportJobResult(ctx context.Context, jobID, status, errMsg stri
 	}
 	req.Header.Set("Authorization", "Bearer "+c.Token)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "novasoft-print-agent")
+	req.Header.Set("User-Agent", c.userAgent())
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return fmt.Errorf("POST result: %w", err)
+		return fmt.Errorf("POST %s: %w", url, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		preview := readLimitedBody(resp.Body, 300)
-		return fmt.Errorf("result rechazado HTTP %d: %s", resp.StatusCode, preview)
+		return &ErrHTTP{Status: resp.StatusCode, Body: readLimitedBody(resp.Body, 300)}
+	}
+	if out != nil {
+		if err := json.NewDecoder(io.LimitReader(resp.Body, 64*1024)).Decode(out); err != nil && !errors.Is(err, io.EOF) {
+			return fmt.Errorf("respuesta inválida: %w", err)
+		}
 	}
 	return nil
 }
