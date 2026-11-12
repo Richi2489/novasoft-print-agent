@@ -44,6 +44,11 @@ Ver [`docs/SETUP.md`](docs/SETUP.md) para la guía paso a paso
 
 Modelos certificados en [`docs/CERTIFIED_PRINTERS.md`](docs/CERTIFIED_PRINTERS.md).
 
+**macOS** (Intel con macOS 10.13+, Apple Silicon con 12+): ver
+[`docs/INSTALAR-MAC.md`](docs/INSTALAR-MAC.md). Imprime por una cola CUPS
+(`lp -o raw`, impresora USB) o directo a una impresora de red `IP:9100`;
+arranca con un LaunchAgent de launchd (`install-mac.sh`).
+
 ## Cómo se ejecuta
 
 Desde **v0.3.0** la forma recomendada es como **servicio de Windows**:
@@ -120,6 +125,9 @@ Requiere **Go 1.22+**.
 
 # O directo:
 go build -o dist\windows\novasoft-agent.exe ./cmd/agent
+
+# macOS: Intel con Go 1.20.14 (macOS 10.13+), arm64 con el Go del repo
+.\build\build-mac.ps1
 ```
 
 ### Estructura
@@ -131,14 +139,15 @@ novasoft-print-agent/
 │   ├── config/             # persistencia JSON (PROGRAMDATA / XDG) + migración
 │   ├── logging/            # log a archivo con rotación por tamaño
 │   ├── winsvc/             # servicio de Windows: SCM, recovery, Event Log
+│   ├── launchd/            # LaunchAgent de macOS (plist + launchctl)
 │   │                       # (*_windows.go con build tag)
 │   ├── pairing/            # handshake HTTP para obtener token
 │   ├── sse/                # cliente SSE (net/http stdlib) + saludo + POST result
 │   ├── journal/            # diario local de entregas (anti-duplicado, v2)
 │   └── printer/            # discovery + send raw + ESC/POS converter
-│                           # (discover/print *_windows.go con build tag)
+│                           # (discover/print *_windows.go y *_unix.go: CUPS + TCP 9100)
 ├── pkg/escpos/             # constantes ESC/POS (reutilizable)
-├── build/                  # scripts de build Windows
+├── build/                  # scripts de build Windows y macOS (build/mac: install/uninstall)
 └── docs/                   # guías para admin + certified printers
 ```
 
