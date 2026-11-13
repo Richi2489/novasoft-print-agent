@@ -46,8 +46,17 @@ func SendRaw(p *Printer, data []byte) error {
 	// StartRawDocument pone el job en "modo raw" — los bytes se envían
 	// a la impresora sin transformación. Critico para ESC/POS: cualquier
 	// interpretación del driver destruiría los bytes de control.
+	//
+	// StartRawDocument consulta antes GetPrinterDriver(nivel 8) para decidir
+	// RAW vs XPS_PASS. En algunos Windows 11 recientes esa consulta falla con
+	// "The data is invalid" para CUALQUIER impresora (feria Qro 2026-11-12:
+	// Adobe PDF y Generic / Text Only igual) aunque la impresión RAW sí
+	// funcione. Si falla, se intenta RAW directo; sólo si eso también falla
+	// se reporta el error (con ambos motivos).
 	if err := h.StartRawDocument("NovaSoft Print Job"); err != nil {
-		return fmt.Errorf("iniciando documento raw: %w", err)
+		if err2 := h.StartDocument("NovaSoft Print Job", "RAW"); err2 != nil {
+			return fmt.Errorf("iniciando documento raw: %v; RAW directo: %w", err, err2)
+		}
 	}
 	// EndDocument es defer-able — si Write falla, aún cerramos.
 	defer func() {
