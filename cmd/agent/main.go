@@ -509,6 +509,9 @@ func handleJob(ctx context.Context, client *sse.Client, diario *journal.Diario, 
 // sin una impresora real.
 var imprimirFn = imprimir
 
+// sendTextFn es el respaldo GDI (v0.5.2); variable para tests.
+var sendTextFn = printer.SendText
+
 // imprimir hace el trabajo físico y devuelve ("printed"|"failed", mensaje).
 func imprimir(p *printer.Printer, job *sse.PrintJob) (string, string) {
 	var payload printer.Payload
@@ -520,7 +523,13 @@ func imprimir(p *printer.Printer, job *sse.PrintJob) (string, string) {
 		return journal.EstadoFallido, fmt.Sprintf("conversión ESC/POS: %v", err)
 	}
 	if err := printer.SendRaw(p, escposBytes); err != nil {
-		return journal.EstadoFallido, fmt.Sprintf("impresión: %v", err)
+		// Respaldo (v0.5.2): el camino de la página de prueba de Windows.
+		// Sin negritas ni corte, pero el ticket sale.
+		log.Printf("⚠️  modo directo rechazado (%v) — imprimo como texto por el controlador", err)
+		if err2 := sendTextFn(p, printer.PlainLines(payload)); err2 != nil {
+			return journal.EstadoFallido, fmt.Sprintf("impresión: %v; respaldo texto: %v", err, err2)
+		}
+		return journal.EstadoImpreso, ""
 	}
 	return journal.EstadoImpreso, ""
 }
