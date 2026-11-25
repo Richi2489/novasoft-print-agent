@@ -3,7 +3,7 @@
 // Por qué existe: en v1 el backend no puede saber si un ticket salió cuando
 // se pierde la confirmación (corte de red, reinicio del contenedor, POST
 // /result que no llegó). Para no duplicar tickets los marcaba "failed" al
-// reconectar — en La Capital, 11 de 79 en una semana. El diario mueve esa
+// reconectar — en el restaurante piloto, 11 de 79 en una semana. El diario mueve esa
 // decisión al único que sabe la verdad: este agente.
 //
 // Regla de oro: una misma delivery_key NUNCA se imprime dos veces.

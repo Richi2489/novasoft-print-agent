@@ -9,7 +9,7 @@ NovaSoft por primera vez.
 - **Impresora térmica 80mm** conectada por USB (o Ethernet), con el
   driver ya instalado en Windows y probado con el Bloc de Notas
   (imprime una página en blanco). Modelos validados:
-  - **GHIA GTP801** (certified, validada en producción en La Capital).
+  - **GHIA GTP801** (certified, validada en producción en el restaurante piloto).
   - **Cualquier POS-80 USB compatible ESC/POS** (supported).
   - Ver `CERTIFIED_PRINTERS.md` para la lista completa.
 - **Conexión a internet** (el agent habla con api.novasoft.mx / Railway).
