@@ -8,7 +8,7 @@ import (
 
 // Código page default para impresoras térmicas 80 mm: CP850 (Latin 1
 // multilingüe). Cubre español mexicano con acentos, ñ, ¡, ¿, € etc.
-// Usado en La Capital (GHIA GTP801). Si alguna impresora no lo soporta,
+// Usado en el restaurante piloto (GHIA GTP801). Si alguna impresora no lo soporta,
 // exponer como config del agent en el futuro.
 //
 // Ref: Epson ESC/POS docs "ESC t n" — selecciona la tabla de caracteres

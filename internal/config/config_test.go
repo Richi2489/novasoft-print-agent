@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-// La Capital corre v0.3.0, que guardaba el emparejamiento en
+// El restaurante piloto corre v0.3.0, que guardaba el emparejamiento en
 // %PROGRAMDATA%\NovaSoft\config.json. Al actualizar, el agente debe
 // encontrarlo y conservar el MISMO token (misma impresora en el backend),
 // sin pedir un código nuevo.

@@ -12,7 +12,7 @@
 
 | Marca | Modelo | Interfaz | Papel | DPI | Validado en |
 |---|---|---|---|---|---|
-| **GHIA** | **GTP801** | USB + Ethernet | 80 mm | 203 | La Capital (Querétaro), 2 unidades en producción. USB primario, Ethernet backup. |
+| **GHIA** | **GTP801** | USB + Ethernet | 80 mm | 203 | Restaurante piloto, 2 unidades en producción. USB primario, Ethernet backup. |
 
 ## Supported
 

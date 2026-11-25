@@ -33,7 +33,7 @@
 //	%PROGRAMDATA%\NovaSoft\config.json          (v0.3.0, servicio + bandeja)
 //	%APPDATA%\NovaSoftPrintAgent\config.json    (v0.2.x)
 //
-// La de v0.3.0 importa: es la que tiene La Capital. Sin migrarla, el
+// La de v0.3.0 importa: es la que tiene el restaurante piloto. Sin migrarla, el
 // instalador v0.4.x encontraba "no emparejado" y pedía un código nuevo,
 // que crea OTRA impresora en el backend (las cajas que la tenían elegida
 // quedaban apuntando a la vieja).
